@@ -6,9 +6,8 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-# import your model from wherever you saved it
-from soccermap import soccermap_model
 
+from models.soccermap import soccermap_model
 
 # ----------------------------
 # Small in-RAM dataset for one shard
@@ -48,8 +47,25 @@ def set_seed(seed=1337):
 
 def make_loaders_for_shard(features_path, targets_path, batch_size=16, num_workers=4):
     # load to CPU
-    feats = torch.load(features_path, map_location="cpu")['X']  # C×N×W×H
-    targs = torch.load(targets_path,  map_location="cpu")['targets']  # N×3 (or 3×N)
+    feats_obj = torch.load(features_path, map_location="cpu")
+    feats = feats_obj["X"] if isinstance(feats_obj, dict) else feats_obj  # C×N×H×W (preferred)
+
+    tobj = torch.load(targets_path, map_location="cpu")
+    targs = tobj["targets"] if isinstance(tobj, dict) else tobj
+    assert feats.dim() == 4, f"Expected 4D features, got {feats.shape}"
+
+    # Enforce (C, N, H, W)
+    C, N, A, B = feats.shape
+    if (A, B) == (105, 68):
+        # already (C,N,H,W)
+        pass
+    elif (A, B) == (68, 105):
+        feats = feats.permute(0, 1, 3, 2).contiguous()
+    else:
+        raise ValueError(f"Unexpected spatial size {A}x{B}; expected 105x68 (or 68x105).")
+
+    assert feats.shape[0] == 14, f"Expected 14 channels, got {feats.shape[0]}"
+
     if targs.dim() == 2 and targs.shape[0] == 3 and targs.shape[1] != 3:
         targs = targs.t().contiguous()  # normalize to N×3
 
@@ -63,16 +79,20 @@ def make_loaders_for_shard(features_path, targets_path, batch_size=16, num_worke
     train_ds = Subset(dataset, train_idx)
     val_ds   = Subset(dataset, val_idx)
 
-    # Collate: stack tensors and ensure (B,C,H,W)
     def collate(batch):
         xs, dsts, ys = zip(*batch)
-        X = torch.stack(xs, dim=0)  # (B,C,H,W) or (B,C,W,H) before permute
-        if X.shape[-2] in (68, 34, 17) and X.shape[-1] in (105, 52, 26):
-            X = X.permute(0, 1, 3, 2).contiguous()
-        X = X.to(torch.float32)                          # <— force fp32 inputs
-        dst_xy = torch.stack(dsts, dim=0).to(torch.float32)
-        y = torch.as_tensor(ys, dtype=torch.float32)
+
+        X = torch.stack(xs, dim=0).to(torch.float32)          # (B,C,H,W)
+        X = torch.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+        dst_xy = torch.stack(dsts, dim=0).to(torch.float32)   # (B,2)
+        dst_xy = torch.nan_to_num(dst_xy, nan=0.0, posinf=0.0, neginf=0.0)
+
+        y = torch.as_tensor(ys, dtype=torch.float32)          # (B,)
+        y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+
         return X, dst_xy, y
+
     
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
@@ -103,8 +123,8 @@ def evaluate(model, loader, device):
 
 
 def train_sequential_shards(
-    feature_dir="soccer_shards",
-    target_dir="soccer_shards_targets",
+    feature_dir="data/soccer_shards",
+    target_dir="data/soccer_shards_targets",
     batch_size=16,
     lr=1e-3,
     weight_decay=1e-5,
@@ -126,9 +146,9 @@ def train_sequential_shards(
     n_shards = len(feat_paths)
 
     # --- Model + optimizer ---
-    model = soccermap_model(in_channels=8, base=32).to(device)
+    model = soccermap_model(in_channels=14, base=32).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scaler = torch.amp.GradScaler(enabled=(device.type == "cuda"))
+    scaler = torch.amp.GradScaler(enabled=False)
 
     # --- Compute total batches per epoch (for tqdm) ---
     all_train_lens = []
@@ -162,9 +182,16 @@ def train_sequential_shards(
                     dst_xy = dst_xy.to(device, dtype=torch.float32)
                     y = y.to(device, dtype=torch.float32)
 
-                    with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type=="cuda")):
-                        _, fused_logits, _ = model(X)
-                        loss = model.target_location_loss(fused_logits, y, dst_xy)
+                    #with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type=="cuda")):
+                    _, fused_logits, _ = model(X)
+                    loss = model.target_location_loss(fused_logits, y, dst_xy)
+                    if not torch.isfinite(loss):
+                        print("Loss is NaN/Inf.")
+                        print("X finite:", torch.isfinite(X).all().item())
+                        print("X min/max:", X.min().item(), X.max().item())
+                        raise RuntimeError("Non-finite loss")
+
+
 
                     scaler.scale(loss).backward()
                     if grad_clip is not None:
@@ -229,8 +256,8 @@ def train_sequential_shards(
 if __name__ == "__main__":
     # Adjust epochs_per_shard if you want more than one pass per shard
     train_sequential_shards(
-    feature_dir="soccer_shards",
-    target_dir="soccer_shards_targets",
+    feature_dir="data/soccer_shards",
+    target_dir="data/soccer_shards_targets",
     batch_size=16,
     lr=1e-3,
     weight_decay=1e-5,

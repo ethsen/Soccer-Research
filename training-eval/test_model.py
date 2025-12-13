@@ -20,24 +20,32 @@ def load_first_shard():
     if not fpaths or not tpaths:
         raise FileNotFoundError("No shard .pt files found.")
 
-    feats = torch.load(fpaths[0], map_location="cpu")['X']  # (C, N, W, H)
-    targs = torch.load(tpaths[0],  map_location="cpu")['targets'] # (N, 3) or (3, N)
+    fobj = torch.load(fpaths[0], map_location="cpu")
+    tobj = torch.load(tpaths[0], map_location="cpu")
+
+    feats = fobj["X"] if isinstance(fobj, dict) else fobj
+    targs = tobj["targets"] if isinstance(tobj, dict) else tobj
+
     if targs.dim() == 2 and targs.shape[0] == 3 and targs.shape[1] != 3:
         targs = targs.t().contiguous()
     assert feats.dim() == 4 and targs.dim() == 2 and targs.shape[1] == 3
     return feats, targs
 
-def get_example(feats_cnwH, targs_n3, i):
-    C, N, W, H = feats_cnwH.shape
+def get_example(feats_cnhw, targs_n3, i):
+    C, N, H, W = feats_cnhw.shape
     if i < 0 or i >= N:
         raise IndexError(f"Index {i} out of range (N={N}).")
-    x = feats_cnwH[:, i, :, :]        # (C, W, H)
-    # Ensure (C, H, W) = (C, 105, 68)
-    if x.shape[-2] in (68, 34, 17) and x.shape[-1] in (105, 52, 26):
-        x = x.permute(0, 2, 1).contiguous()
-    dst_xy = targs_n3[i, :2].clone()  # (x, y)
+
+    x = feats_cnhw[:, i, :, :]        # (C, H, W) == (C, 105, 68)
+
+    if targs_n3.dim() == 2 and targs_n3.shape[0] == 3 and targs_n3.shape[1] != 3:
+        targs_n3 = targs_n3.t().contiguous()
+    assert targs_n3.shape[1] == 3, f"targets should be (N,3), got {targs_n3.shape}"
+
+    dst_xy = targs_n3[i, :2].clone()  # stored indices/coords
     y      = targs_n3[i, 2].clone()   # 0/1
     return x, dst_xy, y
+
 
 def main():
     feats, targs = load_first_shard()
