@@ -11,10 +11,10 @@ import os
 import torch
 
 SAVE_PATH = "dataset_features.pt"
-OUT_DIR = "soccer_shards"
+OUT_DIR = "data/soccer_shards"
 os.makedirs(OUT_DIR, exist_ok=True)
 
-TARGET_OUT_DIR = "soccer_shards_targets"
+TARGET_OUT_DIR = "data/soccer_shards_targets"
 os.makedirs(TARGET_OUT_DIR, exist_ok=True)
 
 DTYPE = torch.float32        # inputs only (targets separate later)
@@ -779,7 +779,7 @@ def build_all_shards(game_ids, api, max_frames_per_shard=20000):
         success_mask = pass_success_mask(spadl_passes_all)          # True if pass is successful
         within10_mask = passes_within_radius_mask(                  # True if teammate within 10m of pass end
             spadl_passes_all, three_sixty_passes_all, home_team_id,
-            fidelity_version=fidelity, radius_m=7.0
+            fidelity_version=fidelity, radius_m=3.0
         )
 
         # keep all unsuccessful passes, OR successful passes that are within 10m radius
@@ -925,7 +925,7 @@ def build_target_shards(game_ids, api, max_frames_per_shard=20000, method="floor
         success_mask = pass_success_mask(spadl_passes_all)
         within10_mask = passes_within_radius_mask(
             spadl_passes_all, three_sixty_all, home_team_id,
-            fidelity_version=fidelity, radius_m=7.0,
+            fidelity_version=fidelity, radius_m=3.0,
         )
         keep_mask = (~success_mask) | (success_mask & within10_mask)
 

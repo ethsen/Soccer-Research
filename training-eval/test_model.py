@@ -3,12 +3,13 @@ import os
 import torch
 import numpy as np
 
-from soccermap import soccermap_model          # your model module
-from visualizer import SoccerVisualizer       # your class above
+from models.soccermap import soccermap_model          # your model module
+from models.passmap import BetterSoccerMap2Head
+from utils.visualizer import SoccerVisualizer       # your class above
 
-FEATURE_DIR = "soccer_shards"
-TARGET_DIR  = "soccer_shards_targets"
-CKPT_PATH   = "soccermap_checkpointv2.pt"             # optional
+FEATURE_DIR = "data/soccer_shards"
+TARGET_DIR  = "data/soccer_shards_targets"
+CKPT_PATH   = "runs/simpe_twohead/best_ckpt.pt"             # optional
 EXAMPLE_IDX = 18828 #np.random.randint(0,20000-1)
 COORDS_ARE_CENTERS = True    # <-- set False if your dst_xy are integer cell indices (0..104, 0..67)
 
@@ -20,8 +21,8 @@ def load_first_shard():
     if not fpaths or not tpaths:
         raise FileNotFoundError("No shard .pt files found.")
 
-    fobj = torch.load(fpaths[0], map_location="cpu")
-    tobj = torch.load(tpaths[0], map_location="cpu")
+    fobj = torch.load(fpaths[1], map_location="cpu")
+    tobj = torch.load(tpaths[1], map_location="cpu")
 
     feats = fobj["X"] if isinstance(fobj, dict) else fobj
     targs = tobj["targets"] if isinstance(tobj, dict) else tobj
@@ -52,7 +53,8 @@ def main():
     x_c_hw, dst_xy, y = get_example(feats, targs, EXAMPLE_IDX)  # x: (C, 105, 68)
 
     # Build model & (optional) load weights
-    model = soccermap_model(in_channels=x_c_hw.shape[0], base=32).to(device).float()
+    #model = soccermap_model(in_channels=x_c_hw.shape[0], base=32).to(device).float()
+    model = BetterSoccerMap2Head().to(device).float()
     if os.path.exists(CKPT_PATH):
         ckpt = torch.load(CKPT_PATH, map_location=device)
         model.load_state_dict(ckpt["model_state_dict"], strict=False)

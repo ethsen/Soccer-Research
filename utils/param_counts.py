@@ -1,4 +1,5 @@
 from models.soccermap import soccermap_model
+from models.passmap import BetterSoccerMap
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters())
@@ -9,6 +10,6 @@ def count_parameters(model):
 
 
 if __name__ == '__main__':
-    sm_model = soccermap_model(14,32)
+    sm_model = BetterSoccerMap()
     print("Soccer Map Model Medium parameters:", count_parameters(sm_model))
 

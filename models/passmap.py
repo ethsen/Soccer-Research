@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Optional, Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -8,32 +8,23 @@ import torch.nn.functional as F
 
 
 # -------------------------
-# Building blocks
+# Blocks (same style as before)
 # -------------------------
 
 def _gn(num_channels: int, num_groups: int = 8) -> nn.GroupNorm:
     g = min(num_groups, num_channels)
-    # ensure divisible
     while num_channels % g != 0 and g > 1:
         g -= 1
     return nn.GroupNorm(g, num_channels)
 
 
 class ResBlock(nn.Module):
-    """
-    Residual block with GroupNorm + SiLU.
-    Optionally uses dilation in the 2nd conv.
-    """
     def __init__(self, c: int, dilation: int = 1, dropout: float = 0.0):
         super().__init__()
         self.norm1 = _gn(c)
-        self.conv1 = nn.Conv2d(c, c, kernel_size=3, padding=1, bias=False)
+        self.conv1 = nn.Conv2d(c, c, 3, padding=1, bias=False)
         self.norm2 = _gn(c)
-        self.conv2 = nn.Conv2d(
-            c, c, kernel_size=3,
-            padding=dilation, dilation=dilation,
-            bias=False
-        )
+        self.conv2 = nn.Conv2d(c, c, 3, padding=dilation, dilation=dilation, bias=False)
         self.drop = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -45,7 +36,7 @@ class ResBlock(nn.Module):
 class Down(nn.Module):
     def __init__(self, c_in: int, c_out: int):
         super().__init__()
-        self.conv = nn.Conv2d(c_in, c_out, kernel_size=3, stride=2, padding=1, bias=False)
+        self.conv = nn.Conv2d(c_in, c_out, 3, stride=2, padding=1, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.conv(x)
@@ -54,8 +45,7 @@ class Down(nn.Module):
 class Up(nn.Module):
     def __init__(self, c_in: int, c_out: int):
         super().__init__()
-        # after upsample, reduce channels with 3x3
-        self.conv = nn.Conv2d(c_in, c_out, kernel_size=3, padding=1, bias=False)
+        self.conv = nn.Conv2d(c_in, c_out, 3, padding=1, bias=False)
 
     def forward(self, x: torch.Tensor, size_hw: Tuple[int, int]) -> torch.Tensor:
         x = F.interpolate(x, size=size_hw, mode="bilinear", align_corners=False)
@@ -63,15 +53,14 @@ class Up(nn.Module):
 
 
 # -------------------------
-# BetterSoccerMap (U-Net)
+# Two-head model
 # -------------------------
 
-class BetterSoccerMap(nn.Module):
+class BetterSoccerMap2Head(nn.Module):
     """
-    U-Net style dense map predictor.
-
-    Input:  (B, in_channels, H=105, W=68)
-    Output: logits (B, 1, H, W)
+    Outputs two logit maps:
+      - dest_logits: (B,1,H,W)  -> softmax over HW for p(dest|state)
+      - succ_logits: (B,1,H,W)  -> sigmoid per-cell for p(success|state,dest=cell)
     """
     def __init__(
         self,
@@ -82,10 +71,9 @@ class BetterSoccerMap(nn.Module):
     ):
         super().__init__()
 
-        # Stem
-        self.stem = nn.Conv2d(in_channels, base, kernel_size=3, padding=1, bias=False)
+        # Backbone U-Net (additive skips)
+        self.stem = nn.Conv2d(in_channels, base, 3, padding=1, bias=False)
 
-        # Encoder
         self.enc1 = nn.Sequential(*[ResBlock(base, dropout=dropout) for _ in range(blocks_per_stage)])
         self.down1 = Down(base, base * 2)
 
@@ -94,156 +82,184 @@ class BetterSoccerMap(nn.Module):
 
         self.enc3 = nn.Sequential(*[ResBlock(base * 4, dropout=dropout) for _ in range(blocks_per_stage)])
 
-        # Bottleneck (dilated to expand receptive field without more pooling)
         self.bot = nn.Sequential(
             ResBlock(base * 4, dilation=2, dropout=dropout),
             ResBlock(base * 4, dilation=2, dropout=dropout),
         )
 
-        # Decoder
-        self.up2 = Up(base * 4, base * 2)               # up to enc2 spatial size
+        self.up2 = Up(base * 4, base * 2)
         self.dec2 = nn.Sequential(*[ResBlock(base * 2, dropout=dropout) for _ in range(blocks_per_stage)])
 
-        self.up1 = Up(base * 2, base)                   # up to enc1 spatial size
+        self.up1 = Up(base * 2, base)
         self.dec1 = nn.Sequential(*[ResBlock(base, dropout=dropout) for _ in range(blocks_per_stage)])
 
-        # Head
-        self.head = nn.Sequential(
+        # Shared trunk head features
+        self.trunk = nn.Sequential(
             _gn(base),
             nn.SiLU(),
-            nn.Conv2d(base, base, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(base, base, 3, padding=1, bias=False),
             _gn(base),
             nn.SiLU(),
-            nn.Conv2d(base, 1, kernel_size=1, bias=True),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Two heads
+        self.dest_head = nn.Conv2d(base, 1, kernel_size=1, bias=True)
+        self.succ_head = nn.Conv2d(base, 1, kernel_size=1, bias=True)
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         # x: (B,C,H,W)
         x = self.stem(x)
 
-        f1 = self.enc1(x)               # (B, base, H, W)
-        x = self.down1(f1)              # (B, 2base, H/2, W/2)
+        f1 = self.enc1(x)         # (B,base,H,W)
+        x = self.down1(f1)        # (B,2b,H/2,W/2)
 
-        f2 = self.enc2(x)               # (B, 2base, H/2, W/2)
-        x = self.down2(f2)              # (B, 4base, H/4, W/4)
+        f2 = self.enc2(x)         # (B,2b,H/2,W/2)
+        x = self.down2(f2)        # (B,4b,H/4,W/4)
 
-        x = self.enc3(x)                # (B, 4base, H/4, W/4)
-        x = self.bot(x)                 # (B, 4base, H/4, W/4)
+        x = self.enc3(x)
+        x = self.bot(x)
 
-        # decode
-        x = self.up2(x, size_hw=(f2.shape[-2], f2.shape[-1]))   # (B, 2base, H/2, W/2)
-        x = x + f2                                              # additive skip (stable vs concat)
+        x = self.up2(x, (f2.shape[-2], f2.shape[-1]))
+        x = x + f2
         x = self.dec2(x)
 
-        x = self.up1(x, size_hw=(f1.shape[-2], f1.shape[-1]))   # (B, base, H, W)
+        x = self.up1(x, (f1.shape[-2], f1.shape[-1]))
         x = x + f1
         x = self.dec1(x)
 
-        logits = self.head(x)                                   # (B,1,H,W)
-        return logits
+        h = self.trunk(x)
+        dest_logits = self.dest_head(h)  # (B,1,H,W)
+        succ_logits = self.succ_head(h)  # (B,1,H,W)
+
+        return {"dest_logits": dest_logits, "succ_logits": succ_logits}
+
+    @torch.no_grad()
+    def predict_maps(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Returns:
+          p_dest: (B,1,H,W) softmax distribution
+          p_succ: (B,1,H,W) sigmoid per-cell
+          p_joint_success: (B,1,H,W) = p_dest * p_succ
+          p_success: (B,) marginal success = sum_c p_dest(c) p_succ(c)
+        """
+        out = self.forward(x)
+        dest_logits = out["dest_logits"]
+        succ_logits = out["succ_logits"]
+        B, _, H, W = dest_logits.shape
+
+        p_dest = torch.softmax(dest_logits.view(B, -1), dim=1).view(B, 1, H, W)
+        p_succ = torch.sigmoid(succ_logits)
+        p_joint = p_dest * p_succ
+        p_success = p_joint.sum(dim=(1, 2, 3))
+        return {"p_dest": p_dest, "p_succ": p_succ, "p_joint_success": p_joint, "p_success": p_success}
 
 
 # -------------------------
-# Loss: single-pixel BCE + dense heatmap BCE
+# Loss (CE for dest + BCE at sampled dest for success)
 # -------------------------
 
 @dataclass
-class PassMapLossConfig:
-    single_pixel_weight: float = 1.0
-    heatmap_weight: float = 1.0
-    heatmap_sigma: float = 2.0         # in grid cells
-    heatmap_clip: float = 1e-4         # avoid exact 0/1 targets everywhere
+class TwoHeadLossCfg:
+    w_dest: float = 1.0
+    w_succ: float = 1.0
+
+    # Optional dense supervision for destination (Gaussian target distribution)
+    use_dense_dest: bool = False
+    dense_dest_sigma: float = 2.0
+    dense_dest_eps: float = 1e-6  # for normalization stability
+
+    # Optional dense auxiliary for success (Gaussian mask gated by outcome)
+    use_dense_succ: bool = False
+    dense_succ_sigma: float = 2.0
+    dense_succ_clip: float = 1e-4
 
 
-def _make_gaussian_targets(
-    dst_xy: torch.Tensor,
-    H: int,
-    W: int,
-    sigma: float,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
+def _gaussian_unnormalized(dst_xy: torch.Tensor, H: int, W: int, sigma: float, dtype, device) -> torch.Tensor:
     """
-    dst_xy: (B,2) with (x_idx, y_idx) in grid coordinates.
-    Returns: (B,1,H,W) Gaussian heatmaps in [0,1].
+    dst_xy: (B,2) with (x_idx,y_idx)
+    returns g: (B,1,H,W) unnormalized exp(-d^2/(2sigma^2))
     """
-    # grid: x in [0..H-1], y in [0..W-1]
+    B = dst_xy.shape[0]
     xs = torch.arange(H, device=device, dtype=dtype).view(1, H, 1)
     ys = torch.arange(W, device=device, dtype=dtype).view(1, 1, W)
-
-    x0 = dst_xy[:, 0].to(dtype).view(-1, 1, 1)
-    y0 = dst_xy[:, 1].to(dtype).view(-1, 1, 1)
-
-    # exp(-((x-x0)^2 + (y-y0)^2)/(2*sigma^2))
+    x0 = dst_xy[:, 0].to(dtype).view(B, 1, 1)
+    y0 = dst_xy[:, 1].to(dtype).view(B, 1, 1)
     inv = 1.0 / (2.0 * (sigma ** 2))
     d2 = (xs - x0) ** 2 + (ys - y0) ** 2
     g = torch.exp(-d2 * inv)  # (B,H,W)
-    return g.unsqueeze(1)     # (B,1,H,W)
+    return g.unsqueeze(1)
 
 
-class PassMapLoss(nn.Module):
+def twohead_loss(
+    out: Dict[str, torch.Tensor],
+    y: torch.Tensor,
+    dst_xy: torch.Tensor,
+    cfg: TwoHeadLossCfg,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
-    Combines:
-      - single-pixel BCE on logits at destination cell
-      - dense heatmap BCE (Gaussian around destination)
-
-    labels y: (B,) with 0/1 for pass success (or your outcome)
-    dst_xy: (B,2) integer grid indices (x_idx, y_idx)
+    out: {"dest_logits": (B,1,H,W), "succ_logits": (B,1,H,W)}
+    y: (B,) in {0,1}
+    dst_xy: (B,2) integer indices (x_idx,y_idx)
     """
-    def __init__(self, cfg: PassMapLossConfig):
-        super().__init__()
-        self.cfg = cfg
+    dest_logits = out["dest_logits"]
+    succ_logits = out["succ_logits"]
+    assert dest_logits.shape == succ_logits.shape
+    B, _, H, W = dest_logits.shape
 
-    def forward(self, logits: torch.Tensor, y: torch.Tensor, dst_xy: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """
-        logits: (B,1,H,W)
-        y:      (B,) float or int in {0,1}
-        dst_xy: (B,2) long/int (x_idx, y_idx)
+    device = dest_logits.device
+    y = y.to(device=device, dtype=dest_logits.dtype).view(B)
+    dst_xy = dst_xy.to(device=device)
+    x_idx = dst_xy[:, 0].long().clamp(0, H - 1)
+    y_idx = dst_xy[:, 1].long().clamp(0, W - 1)
 
-        Returns: (loss, metrics_dict)
-        """
-        assert logits.dim() == 4 and logits.size(1) == 1, f"logits must be (B,1,H,W), got {logits.shape}"
-        B, _, H, W = logits.shape
+    logs: Dict[str, float] = {}
+    total = dest_logits.new_tensor(0.0)
 
-        y = y.to(dtype=logits.dtype, device=logits.device).view(B)
-        dst_xy = dst_xy.to(device=logits.device)
+    # ---- Destination: categorical distribution over HW ----
+    if cfg.w_dest > 0:
+        if not cfg.use_dense_dest:
+            # hard CE
+            dest_logits_flat = dest_logits.view(B, -1)  # (B,HW)
+            dest_index = (x_idx * W + y_idx).long()     # (B,)
+            l_dest = F.cross_entropy(dest_logits_flat, dest_index, reduction="mean")
+        else:
+            # dense target distribution: KL(p_target || p_pred) where p_pred = softmax(dest_logits)
+            # build p_target from gaussian, normalize
+            g = _gaussian_unnormalized(
+                torch.stack([x_idx, y_idx], dim=1), H, W,
+                cfg.dense_dest_sigma, dest_logits.dtype, device
+            )  # (B,1,H,W)
+            g = g.view(B, -1)
+            g = g / (g.sum(dim=1, keepdim=True) + cfg.dense_dest_eps)  # (B,HW)
 
-        # clamp indices to be safe
-        x_idx = dst_xy[:, 0].long().clamp(0, H - 1)
-        y_idx = dst_xy[:, 1].long().clamp(0, W - 1)
+            logp = F.log_softmax(dest_logits.view(B, -1), dim=1)        # (B,HW)
+            # KL(target || pred) = sum target * (log target - log pred)
+            l_dest = (g * (torch.log(g + cfg.dense_dest_eps) - logp)).sum(dim=1).mean()
 
-        losses = {}
-        total = logits.new_tensor(0.0)
+        total = total + cfg.w_dest * l_dest
+        logs["loss_dest"] = float(l_dest.detach().cpu())
 
-        # --- 1) single-pixel BCE at destination cell ---
-        if self.cfg.single_pixel_weight > 0:
-            # gather logits at [b, 0, x_idx[b], y_idx[b]]
-            pix_logits = logits[torch.arange(B, device=logits.device), 0, x_idx, y_idx]
-            single = F.binary_cross_entropy_with_logits(pix_logits, y, reduction="mean")
-            total = total + self.cfg.single_pixel_weight * single
-            losses["loss_single"] = float(single.detach().cpu())
+    # ---- Success: Bernoulli at the sampled destination cell ----
+    if cfg.w_succ > 0:
+        succ_at_dest = succ_logits[torch.arange(B, device=device), 0, x_idx, y_idx]  # (B,)
+        l_succ = F.binary_cross_entropy_with_logits(succ_at_dest, y, reduction="mean")
+        total = total + cfg.w_succ * l_succ
+        logs["loss_succ"] = float(l_succ.detach().cpu())
 
-        # --- 2) dense heatmap BCE (Gaussian target, gated by outcome y) ---
-        if self.cfg.heatmap_weight > 0:
-            # if y==0, target should be near-zero everywhere; if y==1, gaussian peak at dst
-            g = _make_gaussian_targets(
-                torch.stack([x_idx, y_idx], dim=1),
-                H=H, W=W,
-                sigma=self.cfg.heatmap_sigma,
-                device=logits.device,
-                dtype=logits.dtype,
-            )
-            # gate by outcome: unsuccessful -> all zeros
-            g = g * y.view(B, 1, 1, 1)
+    # ---- Optional dense auxiliary for success map (gated by outcome) ----
+    if cfg.use_dense_succ and cfg.w_succ > 0:
+        g = _gaussian_unnormalized(
+            torch.stack([x_idx, y_idx], dim=1), H, W,
+            cfg.dense_succ_sigma, succ_logits.dtype, device
+        )  # (B,1,H,W)
+        g = g * y.view(B, 1, 1, 1)  # unsuccessful -> zeros
 
-            # avoid exact zeros/ones (numerical stability)
-            if self.cfg.heatmap_clip is not None and self.cfg.heatmap_clip > 0:
-                eps = self.cfg.heatmap_clip
-                g = g.clamp(eps, 1.0 - eps)
+        if cfg.dense_succ_clip and cfg.dense_succ_clip > 0:
+            g = g.clamp(cfg.dense_succ_clip, 1.0 - cfg.dense_succ_clip)
 
-            dense = F.binary_cross_entropy_with_logits(logits, g, reduction="mean")
-            total = total + self.cfg.heatmap_weight * dense
-            losses["loss_heatmap"] = float(dense.detach().cpu())
+        l_succ_dense = F.binary_cross_entropy_with_logits(succ_logits, g, reduction="mean")
+        total = total + cfg.w_succ * 0.25 * l_succ_dense  # small auxiliary weight
+        logs["loss_succ_dense"] = float(l_succ_dense.detach().cpu())
 
-        losses["loss_total"] = float(total.detach().cpu())
-        return total, losses
+    logs["loss_total"] = float(total.detach().cpu())
+    return total, logs
