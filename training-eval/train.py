@@ -1,272 +1,651 @@
+#!/usr/bin/env python3
+"""
+Minimal two-head trainer for pass destination + completion.
+
+Model:
+  BetterSoccerMap2Head outputs:
+    dest_logits: (B,1,H,W)  -> softmax over HW for p(dest|state)
+    succ_logits: (B,1,H,W)  -> sigmoid per-cell for p(success | state, dest=cell)
+See models/passmap.py :contentReference[oaicite:3]{index=3}
+
+Data (torch-converter_clean.py):
+  Feature shard: {"X": (C,N,H,W), "channels":[...], "H":H, "W":W, ...}
+  Target shard : {"targets": (N,3), "schema":["end_x_m","end_y_m","success"], ...}
+Targets are end_x_m/end_y_m in meters on a 1m grid (H=105, W=68), and success in {0,1}.
+:contentReference[oaicite:4]{index=4} :contentReference[oaicite:5]{index=5}
+
+Key requirement:
+  Fixed shard-level train/val split across all epochs (saved in split.json).
+This matches the intent of your current shard split logic. :contentReference[oaicite:6]{index=6}
+"""
+
+from __future__ import annotations
+from datetime import datetime
+
+import argparse
+import json
 import os
-import math
 import random
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, Subset
-from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
-from models.soccermap import soccermap_model
 
-# ----------------------------
-# Small in-RAM dataset for one shard
-# ----------------------------
-class OneShardDataset(Dataset):
+import os
+import json
+import hashlib
+
+from collections import OrderedDict
+from torch.utils.data import Dataset
+
+
+import numpy as np
+from typing import Any, Optional
+
+class MemmapShard:
     """
-    Holds one shard fully in memory.
-    features: (C, N, W, H)   e.g., (8, 20000, 105, 68)
-    targets:  (N, 3)         [x, y, outcome]
-    Returns a single sample as (C, H, W), [x, y], outcome
+    Lightweight wrapper holding one shard's memmaps:
+      X: (n,C,H,W) float16
+      T: (n,3) float32
     """
-    def __init__(self, features_cxnwh: torch.Tensor, targets_n3: torch.Tensor):
-        assert features_cxnwh.dim() == 4, "features must be C×N×W×H"
-        assert targets_n3.dim() == 2 and targets_n3.shape[1] == 3, "targets must be N×3"
-        self.x = features_cxnwh     # C×N×W×H
-        self.t = targets_n3         # N×3
-        self.N = self.x.shape[1]
+    def __init__(self, root_dir: str, x_name: str, t_name: str, n: int, C: int, H: int, W: int):
+        self.root_dir = root_dir
+        self.n = int(n)
+        self.C, self.H, self.W = int(C), int(H), int(W)
+
+        x_path = os.path.join(root_dir, x_name)
+        t_path = os.path.join(root_dir, t_name)
+
+        self.X = np.memmap(x_path, mode="r", dtype=np.float16, shape=(self.n, self.C, self.H, self.W))
+        self.T = np.memmap(t_path, mode="r", dtype=np.float32, shape=(self.n, 3))
+
+
+class MemmapManifestDataset(Dataset):
+    """
+    Dataset over memmap shards produced by torch_converter_stratified_memmap.py.
+    Uses small LRU cache of open memmaps to avoid too many open files.
+
+    Returns:
+      x: (C,H,W) float32
+      xy: (2,) long
+      y: scalar float32
+    """
+    def __init__(
+        self,
+        manifest_path: str,    # e.g. <data_root>/train/manifest.json
+        root_dir: str,         # e.g. <data_root>/train
+        swap_xy: bool = False,
+        cache_size: int = 2,
+    ):
+        self.root_dir = root_dir
+        self.swap_xy = swap_xy
+        self.cache_size = int(cache_size)
+
+        with open(manifest_path, "r") as f:
+            man = json.load(f)
+
+        assert man.get("format") == "memmap_v1", f"Expected memmap_v1 manifest, got {man.get('format')}"
+        self.C = int(man["C"])
+        self.H = int(man["H"])
+        self.W = int(man["W"])
+        self.channels = man.get("channels", [])
+        self.shards = man["shards"]
+
+        # prefix sums to map global index -> (shard_id, local_idx)
+        self.starts = []
+        cur = 0
+        for s in self.shards:
+            self.starts.append(cur)
+            cur += int(s["n"])
+        self.total = cur
+
+        # LRU cache: shard_id -> MemmapShard
+        self._cache = OrderedDict()
 
     def __len__(self):
-        return self.N
+        return self.total
 
-    def __getitem__(self, i):
-        # C×N×W×H -> C×W×H for sample i
-        xi = self.x[:, i, :, :]          # (C, W, H)
-        # If your saved order were (C,H,W), this still works; we standardize to (C,H,W) below in collate
-        ti = self.t[i]                   # (3,)
-        dst_xy = ti[:2]                  # [x, y]
-        y = ti[2]                        # outcome
-        return xi, dst_xy, y
+    def _open_shard(self, shard_id: int) -> MemmapShard:
+        shard_id = int(shard_id)
+        if shard_id in self._cache:
+            self._cache.move_to_end(shard_id)
+            return self._cache[shard_id]
+
+        s = self.shards[shard_id]
+        mm = MemmapShard(
+            root_dir=self.root_dir,
+            x_name=s["x_path"],
+            t_name=s["t_path"],
+            n=int(s["n"]),
+            C=self.C, H=self.H, W=self.W,
+        )
+        self._cache[shard_id] = mm
+        if len(self._cache) > self.cache_size:
+            self._cache.popitem(last=False)
+        return mm
+
+    def _locate(self, idx: int):
+        # binary search in starts
+        # starts[k] <= idx < starts[k+1]
+        lo, hi = 0, len(self.starts) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            start = self.starts[mid]
+            end = self.starts[mid + 1] if mid + 1 < len(self.starts) else self.total
+            if start <= idx < end:
+                return mid, idx - start
+            if idx < start:
+                hi = mid - 1
+            else:
+                lo = mid + 1
+        raise IndexError(idx)
+
+    def __getitem__(self, idx: int):
+        sid, j = self._locate(int(idx))
+        shard = self._open_shard(sid)
+
+        # safe copy from read-only memmap -> writable numpy array
+        x_np = np.array(shard.X[j], copy=True)  # (C,H,W) float16
+        x = torch.from_numpy(x_np).to(torch.float32)
+
+        t = shard.T[j]  # (3,) float32
+        xy = torch.tensor(t[:2], dtype=torch.long)
+        if self.swap_xy:
+            xy = xy[[1, 0]]
+        y = torch.tensor(t[2], dtype=torch.float32)
+
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+        return x, xy, y
 
 
-def set_seed(seed=1337):
+
+# -------------------------
+# Utilities
+# -------------------------
+def load_json(path: str) -> dict:
+    with open(path, "r") as f:
+        return json.load(f)
+
+def save_json(path: str, obj: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2)
+
+def resolve_manifest_paths(manifest: dict, root_dir: str) -> List[str]:
+    # manifest["shards"] entries look like {"path": "...", "frames": n}
+    shards = manifest["shards"]
+    paths = []
+    for s in shards:
+        p = s["path"]
+        # allow either absolute or relative
+        if not os.path.isabs(p):
+            p = os.path.join(root_dir, p)
+        paths.append(p)
+    return paths
+
+def load_tensor_or_dict(path: str, keys: Tuple[str, ...]) -> torch.Tensor:
+    obj = torch.load(path, map_location="cpu")
+    if torch.is_tensor(obj):
+        return obj
+    if isinstance(obj, dict):
+        for k in keys:
+            if k in obj:
+                return obj[k]
+    raise KeyError(f"Could not find any of keys={keys} in {path}")
+
+def ensure_cnhw(X: torch.Tensor, H: int, W: int) -> torch.Tensor:
+    # expected (C,N,H,W)
+    if X.dim() != 4:
+        raise RuntimeError(f"Expected X dim=4 (C,N,H,W), got {tuple(X.shape)}")
+    if X.shape[-2] != H or X.shape[-1] != W:
+        raise RuntimeError(f"Expected X HxW={H}x{W}, got {X.shape[-2]}x{X.shape[-1]}")
+    return X.contiguous()
+
+def ensure_n3(T: torch.Tensor) -> torch.Tensor:
+    # expected (N,3)
+    if T.dim() != 2 or T.shape[1] != 3:
+        raise RuntimeError(f"Expected targets (N,3), got {tuple(T.shape)}")
+    return T.contiguous()
+
+def set_all_seeds(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
 
-def make_loaders_for_shard(features_path, targets_path, batch_size=16, num_workers=4):
-    # load to CPU
-    feats_obj = torch.load(features_path, map_location="cpu")
-    feats = feats_obj["X"] if isinstance(feats_obj, dict) else feats_obj  # C×N×H×W (preferred)
+# -------------------------
+# Dataset: one shard at a time
+# -------------------------
+class OneShardDataset(Dataset):
+    def __init__(self, X_cnhw: torch.Tensor, T_n3: torch.Tensor, swap_xy: bool = False):
+        self.X = X_cnhw  # (C,N,H,W)
+        self.T = T_n3    # (N,3) -> [end_x, end_y, success]
+        self.swap_xy = swap_xy
 
-    tobj = torch.load(targets_path, map_location="cpu")
-    targs = tobj["targets"] if isinstance(tobj, dict) else tobj
-    assert feats.dim() == 4, f"Expected 4D features, got {feats.shape}"
+    def __len__(self) -> int:
+        return self.T.shape[0]
 
-    # Enforce (C, N, H, W)
-    C, N, A, B = feats.shape
-    if (A, B) == (105, 68):
-        # already (C,N,H,W)
-        pass
-    elif (A, B) == (68, 105):
-        feats = feats.permute(0, 1, 3, 2).contiguous()
-    else:
-        raise ValueError(f"Unexpected spatial size {A}x{B}; expected 105x68 (or 68x105).")
+    def __getitem__(self, i: int):
+        x = self.X[:, i].to(torch.float32)  # (C,H,W)
+        xy = self.T[i, :2].to(torch.long)   # (2,) integer meters -> indices
+        if self.swap_xy:
+            xy = xy[[1, 0]]
+        y = self.T[i, 2].to(torch.float32)  # scalar 0/1
+        return x, xy, y
 
-    assert feats.shape[0] == 14, f"Expected 14 channels, got {feats.shape[0]}"
 
-    if targs.dim() == 2 and targs.shape[0] == 3 and targs.shape[1] != 3:
-        targs = targs.t().contiguous()  # normalize to N×3
+def collate_batch(batch):
+    xs, xys, ys = zip(*batch)
+    X = torch.stack(xs, dim=0)                            # (B,C,H,W)
+    dst_xy = torch.stack(xys, dim=0).to(torch.long)       # (B,2)
+    y = torch.as_tensor(ys, dtype=torch.float32)          # (B,)
 
-    dataset = OneShardDataset(feats, targs)
+    # extra NaN/inf protection
+    X = torch.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+    return X, dst_xy, y
 
-    # 80/20 split (shuffle indices once per shard)
-    idx = torch.randperm(len(dataset))
-    split = int(0.8 * len(dataset))
-    train_idx, val_idx = idx[:split], idx[split:]
 
-    train_ds = Subset(dataset, train_idx)
-    val_ds   = Subset(dataset, val_idx)
+# -------------------------
+# Two-head loss (same structure as your current implementation)
+# -------------------------
+@dataclass
+class TwoHeadLossCfg:
+    w_dest: float = 0.5
+    w_succ: float = 2.0
+    dest_fail_weight: float = 0.2   # beta in [0,1]
+    succ_pos_weight: float = 1.0    # optional: >1 if completes are rarer
 
-    def collate(batch):
-        xs, dsts, ys = zip(*batch)
+def twohead_loss_fixB(out, y, dst_xy, cfg):
+    dest_logits = out["dest_logits"]   # (B,1,H,W)
+    succ_logits = out["succ_logits"]   # (B,1,H,W)
 
-        X = torch.stack(xs, dim=0).to(torch.float32)          # (B,C,H,W)
-        X = torch.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    B, _, H, W = dest_logits.shape
+    device = dest_logits.device
 
-        dst_xy = torch.stack(dsts, dim=0).to(torch.float32)   # (B,2)
-        dst_xy = torch.nan_to_num(dst_xy, nan=0.0, posinf=0.0, neginf=0.0)
+    y = y.to(device=device).float().view(B).clamp(0, 1)
+    x_idx = dst_xy[:, 0].long().clamp(0, H - 1).to(device)
+    y_idx = dst_xy[:, 1].long().clamp(0, W - 1).to(device)
+    dest_index = (x_idx * W + y_idx).long()
 
-        y = torch.as_tensor(ys, dtype=torch.float32)          # (B,)
-        y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+    logs = {}
+    total = dest_logits.new_tensor(0.0)
 
-        return X, dst_xy, y
+    # ----- (1) Destination loss with soft gating -----
+    if cfg.w_dest > 0:
+        dest_flat = dest_logits.view(B, -1)  # (B, H*W)
+        # per-sample CE (no reduction)
+        ce_i = F.cross_entropy(dest_flat, dest_index, reduction="none")  # (B,)
+        # weight failed passes down
+        beta = float(cfg.dest_fail_weight)
+        w_i = beta + (1.0 - beta) * y        # y=1 -> 1, y=0 -> beta
+        l_dest = (w_i * ce_i).sum() / (w_i.sum() + 1e-8)
+
+        total = total + cfg.w_dest * l_dest
+        logs["loss_dest"] = float(l_dest.detach().cpu())
+
+    # ----- (2) Success loss (prioritized) -----
+    if cfg.w_succ > 0:
+        succ_at = succ_logits[torch.arange(B, device=device), 0, x_idx, y_idx]
+
+        # optional class-imbalance handling: pos_weight
+        # pos_weight multiplies positive examples in BCEWithLogits
+        pos_w = torch.tensor([cfg.succ_pos_weight], device=device, dtype=succ_at.dtype)
+        l_succ = F.binary_cross_entropy_with_logits(
+            succ_at, y, reduction="mean", pos_weight=pos_w
+        )
+
+        total = total + cfg.w_succ * l_succ
+        logs["loss_succ"] = float(l_succ.detach().cpu())
+
+    logs["loss_total"] = float(total.detach().cpu())
+    return total, logs
+
+
+def twohead_loss(out: Dict[str, torch.Tensor],
+                 y: torch.Tensor,
+                 dst_xy: torch.Tensor,
+                 cfg: TwoHeadLossCfg) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    out: {"dest_logits": (B,1,H,W), "succ_logits": (B,1,H,W)}
+    Destination: softmax over HW with cross-entropy to the true cell.
+    Success: BCEWithLogits at the true destination cell.
+    Mirrors the intent of your existing two-head loss. :contentReference[oaicite:7]{index=7}
+    """
+    dest_logits = out["dest_logits"]
+    succ_logits = out["succ_logits"]
+    if dest_logits.shape != succ_logits.shape:
+        raise RuntimeError(f"dest/succ logits mismatch: {tuple(dest_logits.shape)} vs {tuple(succ_logits.shape)}")
+
+    B, _, H, W = dest_logits.shape
+    device = dest_logits.device
+
+    # sanitize targets
+    y = y.to(device=device, dtype=dest_logits.dtype).view(B)
+    y = torch.clamp(y, 0.0, 1.0)
+
+    x_idx = dst_xy[:, 0].long().clamp(0, H - 1).to(device)
+    y_idx = dst_xy[:, 1].long().clamp(0, W - 1).to(device)
+
+    logs: Dict[str, float] = {}
+    total = dest_logits.new_tensor(0.0)
+
+    # dest loss
+    if cfg.w_dest > 0:
+        dest_flat = dest_logits.view(B, -1)               # (B, H*W)
+        dest_index = (x_idx * W + y_idx).long()           # (B,)
+        l_dest = F.cross_entropy(dest_flat, dest_index, reduction="mean")
+        total = total + cfg.w_dest * l_dest
+        logs["loss_dest"] = float(l_dest.detach().cpu())
+
+    # success loss at the sampled cell
+    if cfg.w_succ > 0:
+        succ_at = succ_logits[torch.arange(B, device=device), 0, x_idx, y_idx]
+        l_succ = F.binary_cross_entropy_with_logits(succ_at, y, reduction="mean")
+        total = total + cfg.w_succ * l_succ
+        logs["loss_succ"] = float(l_succ.detach().cpu())
+
+    logs["loss_total"] = float(total.detach().cpu())
+    return total, logs
+
+def twohead_loss_success_guided(
+    out: Dict[str, torch.Tensor],
+    y: torch.Tensor,          # (B,) completion labels in {0,1}
+    dst_xy: torch.Tensor,     # (B,2) true destination
+    cfg: TwoHeadLossCfg,
+):
+    dest_logits = out["dest_logits"]   # (B,1,H,W)
+    succ_logits = out["succ_logits"]   # (B,1,H,W)
+
+    B, _, H, W = dest_logits.shape
+    device = dest_logits.device
+
+    # sanitize targets
+    y = y.to(device=device).float().clamp(0, 1)
+    x_idx = dst_xy[:, 0].long().clamp(0, H - 1).to(device)
+    y_idx = dst_xy[:, 1].long().clamp(0, W - 1).to(device)
+
+    logs = {}
+    total = dest_logits.new_tensor(0.0)
+
+    # --------------------------------------------------
+    # 1. Destination loss — ONLY on completed passes
+    # --------------------------------------------------
+    if cfg.w_dest > 0:
+        mask = y > 0.5  # completed passes only
+        if mask.any():
+            dest_flat = dest_logits[mask].view(-1, H * W)
+            dest_index = (x_idx[mask] * W + y_idx[mask]).long()
+            l_dest = F.cross_entropy(dest_flat, dest_index, reduction="mean")
+            total = total + cfg.w_dest * l_dest
+            logs["loss_dest"] = float(l_dest.detach().cpu())
+        else:
+            logs["loss_dest"] = 0.0
+
+    # --------------------------------------------------
+    # 2. Success loss — at attempted destination
+    # --------------------------------------------------
+    if cfg.w_succ > 0:
+        succ_at = succ_logits[torch.arange(B, device=device), 0, x_idx, y_idx]
+        l_succ = F.binary_cross_entropy_with_logits(succ_at, y, reduction="mean")
+        total = total + cfg.w_succ * l_succ
+        logs["loss_succ"] = float(l_succ.detach().cpu())
+
+    logs["loss_total"] = float(total.detach().cpu())
+    return total, logs
+
+# -------------------------
+# Train / Eval
+# -------------------------
+@torch.no_grad()
+def eval_epoch(model: nn.Module,
+               feat_paths: List[str],
+               targ_paths: List[str],
+               device: torch.device,
+               batch_size: int,
+               num_workers: int,
+               swap_xy: bool,
+               loss_cfg: TwoHeadLossCfg) -> Tuple[float, float, float]:
+    model.eval()
+    total, total_dest, total_succ, n = 0.0, 0.0, 0.0, 0
+
+    for fp, tp in zip(feat_paths, targ_paths):
+        X = ensure_cnhw(load_tensor_or_dict(fp, ("X",)), H=105, W=68)
+        T = ensure_n3(load_tensor_or_dict(tp, ("targets", "y", "Y")))
+
+        ds = OneShardDataset(X, T, swap_xy=swap_xy)
+        dl = DataLoader(ds, batch_size=batch_size, shuffle=False,
+                        num_workers=num_workers, pin_memory=True, collate_fn=collate_batch)
+
+        for xb, dst_xy, y in dl:
+            xb = xb.to(device, non_blocking=True)
+            dst_xy = dst_xy.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+
+            out = model(xb)
+            loss, logs = twohead_loss(out, y, dst_xy, loss_cfg)
+            b = xb.size(0)
+            total += float(loss.detach().cpu()) * b
+            total_dest += logs.get("loss_dest", 0.0) * b
+            total_succ += logs.get("loss_succ", 0.0) * b
+            n += b
+
+    n = max(1, n)
+    return total / n, total_dest / n, total_succ / n
+
+
+def train():
+    p = argparse.ArgumentParser()
+    p.add_argument("--data_root", type=str, required=True,
+               help="Root directory containing train/ and val/ folders with memmap manifests.")
+    p.add_argument("--cache_size", type=int, default=2,
+                help="How many memmap shards to keep open (LRU).")
+
+    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--batch_size", type=int, default=64)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--wd", type=float, default=1e-4)
+    p.add_argument("--grad_clip", type=float, default=1.0)
+
+    p.add_argument("--seed", type=int, default=19)
+    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--cpu", action="store_true")
+    p.add_argument("--swap_xy", action="store_true")
+
+    # loss weights
+    p.add_argument("--w_dest", type=float, default=1.0)
+    p.add_argument("--w_succ", type=float, default=1.0)
+
+    # output
+    p.add_argument("--runs_dir", type=str, default="runs")
+    p.add_argument("--save_path", type=str, default="best_ckpt.pt")
+    args = p.parse_args()
+
+    # final runs directory
 
     
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True, drop_last=False,
-        collate_fn=collate
+
+
+
+    set_all_seeds(args.seed)
+
+    device = torch.device("cuda" if (torch.cuda.is_available() and not args.cpu) else "cpu")
+    print(f"Device: {device}")
+
+    train_root = os.path.join(args.data_root, "train")
+    val_root   = os.path.join(args.data_root, "val")
+
+    train_ds = MemmapManifestDataset(
+        manifest_path=os.path.join(train_root, "manifest.json"),
+        root_dir=train_root,
+        swap_xy=args.swap_xy,
+        cache_size=args.cache_size,
     )
-    val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True, drop_last=False,
-        collate_fn=collate
+    val_ds = MemmapManifestDataset(
+        manifest_path=os.path.join(val_root, "manifest.json"),
+        root_dir=val_root,
+        swap_xy=args.swap_xy,
+        cache_size=args.cache_size,
     )
-    return train_loader, val_loader, len(train_ds), len(val_ds)
+
+    print(f"[data] train samples={len(train_ds)} val samples={len(val_ds)}")
+    print(f"[data] C,H,W = {train_ds.C},{train_ds.H},{train_ds.W}")
 
 
-def evaluate(model, loader, device):
-    model.eval()
-    total_loss, total = 0.0, 0
-    with torch.no_grad():
-        for X, dst_xy, y in loader:
-            X = X.to(device)
-            dst_xy = dst_xy.to(device)
-            y = y.to(device)
-            _, fused_logits, _ = model(X)
-            loss = model.target_location_loss(fused_logits, y, dst_xy)
-            total_loss += loss.item() * X.size(0)
-            total += X.size(0)
-    return total_loss / max(total, 1)
+    train_dl = DataLoader(
+    train_ds,
+    batch_size=args.batch_size,
+    shuffle=True,
+    num_workers=args.num_workers,
+    pin_memory=(device.type == "cuda"),
+    collate_fn=collate_batch,
+    drop_last=True,
+    )
+    val_dl = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        collate_fn=collate_batch,
+        drop_last=False,
+    )
 
 
-def train_sequential_shards(
-    feature_dir="data/soccer_shards",
-    target_dir="data/soccer_shards_targets",
-    batch_size=16,
-    lr=1e-3,
-    weight_decay=1e-5,
-    num_workers=4,
-    total_epochs=30,
-    grad_clip=1.0,
-    seed=1337,
-    save_every_epoch=True,
-    ckpt_path="soccermap_checkpoint.pt",
-    plot_path="training_losses.png",
-):
-    set_seed(seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # model
+    from models.passmap import BetterSoccerMap2Head
+    model = BetterSoccerMap2Head(in_channels=14, base=64, blocks_per_stage=2, dropout=0.0).to(device).float()
+    arch_name = model.__class__.__name__
 
-    # --- Discover shards ---
-    feat_paths = sorted([os.path.join(feature_dir, f) for f in os.listdir(feature_dir) if f.endswith(".pt")])
-    targ_paths = sorted([os.path.join(target_dir,  f) for f in os.listdir(target_dir)  if f.endswith(".pt")])
-    assert len(feat_paths) == len(targ_paths) and len(feat_paths) > 0, "Shard mismatch / not found."
-    n_shards = len(feat_paths)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M")
+    args.run_dir = os.path.join(args.runs_dir, f"{stamp}_{arch_name}")
+    os.makedirs(args.run_dir, exist_ok=True)
+    
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
 
-    # --- Model + optimizer ---
-    model = soccermap_model(in_channels=14, base=32).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scaler = torch.amp.GradScaler(enabled=False)
+    loss_cfg = TwoHeadLossCfg(w_dest=args.w_dest, w_succ=args.w_succ)
 
-    # --- Compute total batches per epoch (for tqdm) ---
-    all_train_lens = []
-    for fpath, tpath in zip(feat_paths, targ_paths):
-        _, _, ntr, _ = make_loaders_for_shard(fpath, tpath, batch_size=batch_size, num_workers=0)
-        all_train_lens.append(ntr)
-    total_train_samples = sum(all_train_lens)
-    total_batches_per_epoch = math.ceil(total_train_samples / batch_size)
+    best_val = float("inf")
+    history = {"train_total": [], "train_dest": [], "train_succ": [],
+               "val_total": [], "val_dest": [], "val_succ": []}
 
-    # --- Tracking lists ---
-    epoch_train_losses = []
-    epoch_val_losses = []
+    def _run_epoch(dl, train_mode: bool):
+        if train_mode:
+            model.train()
+        else:
+            model.eval()
 
-    # ---- Main training loop ----
-    for epoch in range(1, total_epochs + 1):
-        model.train()
-        running_loss, seen = 0.0, 0
-        val_loss_epoch = 0.0
-        val_seen = 0
+        running_total, running_dest, running_succ, n_seen = 0.0, 0.0, 0.0, 0
 
-        with tqdm(total=total_batches_per_epoch, desc=f"Epoch {epoch}/{total_epochs}", leave=True) as pbar:
-            for s, (fpath, tpath) in enumerate(zip(feat_paths, targ_paths), start=1):
-                train_loader, val_loader, ntr, nva = make_loaders_for_shard(
-                    fpath, tpath, batch_size=batch_size, num_workers=num_workers
-                )
+        it = tqdm(dl, desc=("train" if train_mode else "val"), leave=False)
+        for xb, dst_xy, y in it:
+            xb = xb.to(device, non_blocking=True)
+            dst_xy = dst_xy.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
 
-                # --- train on this shard ---
-                for X, dst_xy, y in train_loader:
-                    optimizer.zero_grad(set_to_none=True)
-                    X = X.to(device, dtype=torch.float32)
-                    dst_xy = dst_xy.to(device, dtype=torch.float32)
-                    y = y.to(device, dtype=torch.float32)
+            # hard stop if NaNs sneak in
+            if not torch.isfinite(xb).all():
+                raise RuntimeError("Non-finite xb detected in dataloader batch")
 
-                    #with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type=="cuda")):
-                    _, fused_logits, _ = model(X)
-                    loss = model.target_location_loss(fused_logits, y, dst_xy)
-                    if not torch.isfinite(loss):
-                        print("Loss is NaN/Inf.")
-                        print("X finite:", torch.isfinite(X).all().item())
-                        print("X min/max:", X.min().item(), X.max().item())
-                        raise RuntimeError("Non-finite loss")
+            if train_mode:
+                opt.zero_grad(set_to_none=True)
 
+            with torch.set_grad_enabled(train_mode):
+                out = model(xb)
+                loss, logs = twohead_loss_fixB(out, y, dst_xy, loss_cfg)
 
+                if not torch.isfinite(loss):
+                    print("\nNon-finite loss encountered!")
+                    print("  xb min/max:", float(xb.min()), float(xb.max()))
+                    print("  dest_logits min/max:",
+                          float(out["dest_logits"].min().detach().cpu()),
+                          float(out["dest_logits"].max().detach().cpu()))
+                    print("  succ_logits min/max:",
+                          float(out["succ_logits"].min().detach().cpu()),
+                          float(out["succ_logits"].max().detach().cpu()))
+                    raise RuntimeError("Stopping due to non-finite loss")
 
-                    scaler.scale(loss).backward()
-                    if grad_clip is not None:
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                    scaler.step(optimizer)
-                    scaler.update()
+                if train_mode:
+                    loss.backward()
+                    if args.grad_clip and args.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    opt.step()
 
-                    bs = X.size(0)
-                    running_loss += loss.item() * bs
-                    seen += bs
-                    train_running_avg = running_loss / max(seen, 1)
-                    pbar.set_postfix(train_loss=f"{train_running_avg:.4f}")
-                    pbar.update(1)
+            b = xb.size(0)
+            running_total += float(logs["loss_total"]) * b
+            running_dest  += float(logs.get("loss_dest", 0.0)) * b
+            running_succ  += float(logs.get("loss_succ", 0.0)) * b
+            n_seen += b
 
-                # --- evaluate shard ---
-                val_loss = evaluate(model, val_loader, device)
-                val_loss_epoch += val_loss * nva
-                val_seen += nva
-                pbar.set_postfix(train_loss=f"{train_running_avg:.4f}", val_loss=f"{val_loss:.4f}")
+            it.set_postfix({
+                "loss": f"{running_total/max(1,n_seen):.4f}",
+                "dest": f"{running_dest/max(1,n_seen):.4f}",
+                "succ": f"{running_succ/max(1,n_seen):.4f}",
+            })
 
-        # ---- end of epoch ----
-        final_train_loss = running_loss / max(seen, 1)
-        final_val_loss = val_loss_epoch / max(val_seen, 1)
-        epoch_train_losses.append(final_train_loss)
-        epoch_val_losses.append(final_val_loss)
+        return (
+            running_total / max(1, n_seen),
+            running_dest  / max(1, n_seen),
+            running_succ  / max(1, n_seen),
+        )
 
-        print(f"Epoch {epoch}/{total_epochs} | Train: {final_train_loss:.6f} | Val: {final_val_loss:.6f}")
+    for epoch in range(args.epochs):
+        t0 = time.time()
 
-        if save_every_epoch:
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "train_loss": final_train_loss,
-                    "val_loss": final_val_loss,
-                },
-                ckpt_path,
-            )
+        train_total, train_dest, train_succ = _run_epoch(train_dl, train_mode=True)
+        val_total, val_dest, val_succ = _run_epoch(val_dl,   train_mode=False)
 
-    print("\nTraining complete")
+        dt = time.time() - t0
+        print(f"Epoch {epoch:03d} | "
+              f"train={train_total:.6f} (dest={train_dest:.6f}, succ={train_succ:.6f}) | "
+              f"val={val_total:.6f} (dest={val_dest:.6f}, succ={val_succ:.6f}) | "
+              f"time={dt:.1f}s")
 
-    # --- Plot losses ---
-    epochs = range(1, total_epochs + 1)
-    plt.figure(figsize=(8, 5))
-    plt.plot(epochs, epoch_train_losses, label="Train Loss", linewidth=2)
-    plt.plot(epochs, epoch_val_losses, label="Validation Loss", linewidth=2)
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("Training and Validation Loss")
+        history["train_total"].append(train_total)
+        history["train_dest"].append(train_dest)
+        history["train_succ"].append(train_succ)
+        history["val_total"].append(val_total)
+        history["val_dest"].append(val_dest)
+        history["val_succ"].append(val_succ)
+
+        if val_total < best_val:
+            best_val = val_total
+            ckpt_path = os.path.join(args.run_dir, args.save_path)
+            torch.save({
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "opt": opt.state_dict(),
+                "history": history,
+                "args": vars(args),
+            }, ckpt_path)
+            print(f"  ✓ saved best checkpoint -> {ckpt_path}")
+
+    # plot losses
+    fig_path = os.path.join(args.run_dir, "loss_curve.png")
+    xs = list(range(args.epochs))
+    plt.figure()
+    plt.plot(xs, history["train_total"], label="train_total")
+    plt.plot(xs, history["val_total"], label="val_total")
+    plt.xlabel("epoch")
+    plt.ylabel("loss")
+    plt.title("Epoch vs Loss")
     plt.legend()
-    plt.grid(alpha=0.3)
     plt.tight_layout()
-    plt.savefig(plot_path, dpi=150)
-    plt.close()
-    print(f"Saved training loss plot → {plot_path}")
+    plt.savefig(fig_path, dpi=150)
+    print(f"Saved loss plot -> {fig_path}")
 
-    return model, epoch_train_losses, epoch_val_losses
+    save_json(os.path.join(args.run_dir, "history.json"), history)
+
+
 
 
 if __name__ == "__main__":
-    # Adjust epochs_per_shard if you want more than one pass per shard
-    train_sequential_shards(
-    feature_dir="data/soccer_shards",
-    target_dir="data/soccer_shards_targets",
-    batch_size=16,
-    lr=1e-3,
-    weight_decay=1e-5,
-    num_workers=4,
-    total_epochs=30,
-    grad_clip=1.0,
-    seed=1337,
-    save_every_epoch=True,
-    ckpt_path="soccermap_checkpoint_v2.pt",
-    )
-
-    
+    train()
