@@ -1,104 +1,88 @@
 #!/usr/bin/env python3
-"""
-Minimal two-head trainer for pass destination + completion.
-
-Model:
-  BetterSoccerMap2Head outputs:
-    dest_logits: (B,1,H,W)  -> softmax over HW for p(dest|state)
-    succ_logits: (B,1,H,W)  -> sigmoid per-cell for p(success | state, dest=cell)
-See models/passmap.py :contentReference[oaicite:3]{index=3}
-
-Data (torch-converter_clean.py):
-  Feature shard: {"X": (C,N,H,W), "channels":[...], "H":H, "W":W, ...}
-  Target shard : {"targets": (N,3), "schema":["end_x_m","end_y_m","success"], ...}
-Targets are end_x_m/end_y_m in meters on a 1m grid (H=105, W=68), and success in {0,1}.
-:contentReference[oaicite:4]{index=4} :contentReference[oaicite:5]{index=5}
-
-Key requirement:
-  Fixed shard-level train/val split across all epochs (saved in split.json).
-This matches the intent of your current shard split logic. :contentReference[oaicite:6]{index=6}
-"""
-
 from __future__ import annotations
-from datetime import datetime
 
 import argparse
 import json
 import os
 import random
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Tuple
+
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-import matplotlib.pyplot as plt
-from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
+from torch.amp import autocast, GradScaler
 
 
-import os
-import json
-import hashlib
+from utils.static_maps import PitchStaticChannels, PitchDims
+from utils.train_utils import log_fixed_val_grid_to_tensorboard, pick_fixed_val_indices
+from models.bettermap import BetterSoccerMap2Head
+from models.footballmap import PassMap
+from models.pitchvision import PitchVisionNet 
 
-from collections import OrderedDict
-from torch.utils.data import Dataset
+
+# -------------------------
+# Repro
+# -------------------------
+
+def set_all_seeds(seed: int):
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
 
 
-import numpy as np
-from typing import Any, Optional
+# -------------------------
+# Memmap dataset
+# -------------------------
 
 class MemmapShard:
-    """
-    Lightweight wrapper holding one shard's memmaps:
-      X: (n,C,H,W) float16
-      T: (n,3) float32
-    """
     def __init__(self, root_dir: str, x_name: str, t_name: str, n: int, C: int, H: int, W: int):
-        self.root_dir = root_dir
         self.n = int(n)
         self.C, self.H, self.W = int(C), int(H), int(W)
-
         x_path = os.path.join(root_dir, x_name)
         t_path = os.path.join(root_dir, t_name)
-
         self.X = np.memmap(x_path, mode="r", dtype=np.float16, shape=(self.n, self.C, self.H, self.W))
         self.T = np.memmap(t_path, mode="r", dtype=np.float32, shape=(self.n, 3))
 
 
 class MemmapManifestDataset(Dataset):
     """
-    Dataset over memmap shards produced by torch_converter_stratified_memmap.py.
-    Uses small LRU cache of open memmaps to avoid too many open files.
-
     Returns:
       x: (C,H,W) float32
-      xy: (2,) long
-      y: scalar float32
+      dst_xy: (2,) long  (x_idx, y_idx)
+      y: scalar float32  (0/1)
     """
-    def __init__(
-        self,
-        manifest_path: str,    # e.g. <data_root>/train/manifest.json
-        root_dir: str,         # e.g. <data_root>/train
-        swap_xy: bool = False,
-        cache_size: int = 2,
-    ):
+    def __init__(self, manifest_path: str, root_dir: str, swap_xy: bool = False, cache_size: int = 2):
         self.root_dir = root_dir
-        self.swap_xy = swap_xy
+        self.swap_xy = bool(swap_xy)
         self.cache_size = int(cache_size)
 
         with open(manifest_path, "r") as f:
             man = json.load(f)
 
-        assert man.get("format") == "memmap_v1", f"Expected memmap_v1 manifest, got {man.get('format')}"
+        if man.get("format") != "memmap_v1":
+            raise RuntimeError(f"Expected memmap_v1, got {man.get('format')}")
+
         self.C = int(man["C"])
         self.H = int(man["H"])
         self.W = int(man["W"])
-        self.channels = man.get("channels", [])
-        self.shards = man["shards"]
+        self.channels = list(man.get("channels", []))
+        self.shards = list(man["shards"])
 
-        # prefix sums to map global index -> (shard_id, local_idx)
         self.starts = []
         cur = 0
         for s in self.shards:
@@ -106,8 +90,7 @@ class MemmapManifestDataset(Dataset):
             cur += int(s["n"])
         self.total = cur
 
-        # LRU cache: shard_id -> MemmapShard
-        self._cache = OrderedDict()
+        self._cache: "OrderedDict[int, MemmapShard]" = OrderedDict()
 
     def __len__(self):
         return self.total
@@ -131,9 +114,7 @@ class MemmapManifestDataset(Dataset):
             self._cache.popitem(last=False)
         return mm
 
-    def _locate(self, idx: int):
-        # binary search in starts
-        # starts[k] <= idx < starts[k+1]
+    def _locate(self, idx: int) -> Tuple[int, int]:
         lo, hi = 0, len(self.starts) - 1
         while lo <= hi:
             mid = (lo + hi) // 2
@@ -151,303 +132,266 @@ class MemmapManifestDataset(Dataset):
         sid, j = self._locate(int(idx))
         shard = self._open_shard(sid)
 
-        # safe copy from read-only memmap -> writable numpy array
-        x_np = np.array(shard.X[j], copy=True)  # (C,H,W) float16
-        x = torch.from_numpy(x_np).to(torch.float32)
+        x_np = np.array(shard.X[j], copy=True)          # (C,H,W) float16
+        t_np = np.array(shard.T[j], copy=True)          # (3,) float32
 
-        t = shard.T[j]  # (3,) float32
-        xy = torch.tensor(t[:2], dtype=torch.long)
+        x = torch.from_numpy(x_np).to(torch.float32)    # (C,H,W)
+        dst_xy = torch.from_numpy(t_np[:2]).to(torch.long)  # (2,)
         if self.swap_xy:
-            xy = xy[[1, 0]]
-        y = torch.tensor(t[2], dtype=torch.float32)
+            dst_xy = dst_xy[[1, 0]]
+        y = torch.tensor(float(t_np[2]), dtype=torch.float32)  # scalar
 
-        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-        y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
-        return x, xy, y
-
-
-
-# -------------------------
-# Utilities
-# -------------------------
-def load_json(path: str) -> dict:
-    with open(path, "r") as f:
-        return json.load(f)
-
-def save_json(path: str, obj: dict) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(obj, f, indent=2)
-
-def resolve_manifest_paths(manifest: dict, root_dir: str) -> List[str]:
-    # manifest["shards"] entries look like {"path": "...", "frames": n}
-    shards = manifest["shards"]
-    paths = []
-    for s in shards:
-        p = s["path"]
-        # allow either absolute or relative
-        if not os.path.isabs(p):
-            p = os.path.join(root_dir, p)
-        paths.append(p)
-    return paths
-
-def load_tensor_or_dict(path: str, keys: Tuple[str, ...]) -> torch.Tensor:
-    obj = torch.load(path, map_location="cpu")
-    if torch.is_tensor(obj):
-        return obj
-    if isinstance(obj, dict):
-        for k in keys:
-            if k in obj:
-                return obj[k]
-    raise KeyError(f"Could not find any of keys={keys} in {path}")
-
-def ensure_cnhw(X: torch.Tensor, H: int, W: int) -> torch.Tensor:
-    # expected (C,N,H,W)
-    if X.dim() != 4:
-        raise RuntimeError(f"Expected X dim=4 (C,N,H,W), got {tuple(X.shape)}")
-    if X.shape[-2] != H or X.shape[-1] != W:
-        raise RuntimeError(f"Expected X HxW={H}x{W}, got {X.shape[-2]}x{X.shape[-1]}")
-    return X.contiguous()
-
-def ensure_n3(T: torch.Tensor) -> torch.Tensor:
-    # expected (N,3)
-    if T.dim() != 2 or T.shape[1] != 3:
-        raise RuntimeError(f"Expected targets (N,3), got {tuple(T.shape)}")
-    return T.contiguous()
-
-def set_all_seeds(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-# -------------------------
-# Dataset: one shard at a time
-# -------------------------
-class OneShardDataset(Dataset):
-    def __init__(self, X_cnhw: torch.Tensor, T_n3: torch.Tensor, swap_xy: bool = False):
-        self.X = X_cnhw  # (C,N,H,W)
-        self.T = T_n3    # (N,3) -> [end_x, end_y, success]
-        self.swap_xy = swap_xy
-
-    def __len__(self) -> int:
-        return self.T.shape[0]
-
-    def __getitem__(self, i: int):
-        x = self.X[:, i].to(torch.float32)  # (C,H,W)
-        xy = self.T[i, :2].to(torch.long)   # (2,) integer meters -> indices
-        if self.swap_xy:
-            xy = xy[[1, 0]]
-        y = self.T[i, 2].to(torch.float32)  # scalar 0/1
-        return x, xy, y
+        return x, dst_xy, y
 
 
 def collate_batch(batch):
     xs, xys, ys = zip(*batch)
-    X = torch.stack(xs, dim=0)                            # (B,C,H,W)
-    dst_xy = torch.stack(xys, dim=0).to(torch.long)       # (B,2)
-    y = torch.as_tensor(ys, dtype=torch.float32)          # (B,)
+    X = torch.stack(xs, dim=0)                   # (B,C,H,W)
+    dst_xy = torch.stack(xys, dim=0).long()      # (B,2)
+    y = torch.stack(ys, dim=0).float().view(-1)  # (B,)
 
-    # extra NaN/inf protection
     X = torch.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
     y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
     return X, dst_xy, y
 
 
+"""# -------------------------
+# Loss (dest CE + succ BCE@dest)
 # -------------------------
-# Two-head loss (same structure as your current implementation)
-# -------------------------
+
 @dataclass
 class TwoHeadLossCfg:
-    w_dest: float = 0.5
-    w_succ: float = 2.0
-    dest_fail_weight: float = 0.2   # beta in [0,1]
-    succ_pos_weight: float = 1.0    # optional: >1 if completes are rarer
+    w_dest: float = 1.0
+    w_succ: float = 1.0
 
-def twohead_loss_fixB(out, y, dst_xy, cfg):
+
+def twohead_loss(out: Dict[str, torch.Tensor], y: torch.Tensor, dst_xy: torch.Tensor, cfg: TwoHeadLossCfg):
     dest_logits = out["dest_logits"]   # (B,1,H,W)
     succ_logits = out["succ_logits"]   # (B,1,H,W)
 
-    B, _, H, W = dest_logits.shape
-    device = dest_logits.device
-
-    y = y.to(device=device).float().view(B).clamp(0, 1)
-    x_idx = dst_xy[:, 0].long().clamp(0, H - 1).to(device)
-    y_idx = dst_xy[:, 1].long().clamp(0, W - 1).to(device)
-    dest_index = (x_idx * W + y_idx).long()
-
-    logs = {}
-    total = dest_logits.new_tensor(0.0)
-
-    # ----- (1) Destination loss with soft gating -----
-    if cfg.w_dest > 0:
-        dest_flat = dest_logits.view(B, -1)  # (B, H*W)
-        # per-sample CE (no reduction)
-        ce_i = F.cross_entropy(dest_flat, dest_index, reduction="none")  # (B,)
-        # weight failed passes down
-        beta = float(cfg.dest_fail_weight)
-        w_i = beta + (1.0 - beta) * y        # y=1 -> 1, y=0 -> beta
-        l_dest = (w_i * ce_i).sum() / (w_i.sum() + 1e-8)
-
-        total = total + cfg.w_dest * l_dest
-        logs["loss_dest"] = float(l_dest.detach().cpu())
-
-    # ----- (2) Success loss (prioritized) -----
-    if cfg.w_succ > 0:
-        succ_at = succ_logits[torch.arange(B, device=device), 0, x_idx, y_idx]
-
-        # optional class-imbalance handling: pos_weight
-        # pos_weight multiplies positive examples in BCEWithLogits
-        pos_w = torch.tensor([cfg.succ_pos_weight], device=device, dtype=succ_at.dtype)
-        l_succ = F.binary_cross_entropy_with_logits(
-            succ_at, y, reduction="mean", pos_weight=pos_w
-        )
-
-        total = total + cfg.w_succ * l_succ
-        logs["loss_succ"] = float(l_succ.detach().cpu())
-
-    logs["loss_total"] = float(total.detach().cpu())
-    return total, logs
-
-
-def twohead_loss(out: Dict[str, torch.Tensor],
-                 y: torch.Tensor,
-                 dst_xy: torch.Tensor,
-                 cfg: TwoHeadLossCfg) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """
-    out: {"dest_logits": (B,1,H,W), "succ_logits": (B,1,H,W)}
-    Destination: softmax over HW with cross-entropy to the true cell.
-    Success: BCEWithLogits at the true destination cell.
-    Mirrors the intent of your existing two-head loss. :contentReference[oaicite:7]{index=7}
-    """
-    dest_logits = out["dest_logits"]
-    succ_logits = out["succ_logits"]
     if dest_logits.shape != succ_logits.shape:
         raise RuntimeError(f"dest/succ logits mismatch: {tuple(dest_logits.shape)} vs {tuple(succ_logits.shape)}")
 
     B, _, H, W = dest_logits.shape
     device = dest_logits.device
 
-    # sanitize targets
-    y = y.to(device=device, dtype=dest_logits.dtype).view(B)
-    y = torch.clamp(y, 0.0, 1.0)
-
-    x_idx = dst_xy[:, 0].long().clamp(0, H - 1).to(device)
-    y_idx = dst_xy[:, 1].long().clamp(0, W - 1).to(device)
+    y = y.to(device=device, dtype=dest_logits.dtype).view(B).clamp(0.0, 1.0)
+    x_idx = dst_xy[:, 0].to(device=device).long().clamp(0, H - 1)
+    y_idx = dst_xy[:, 1].to(device=device).long().clamp(0, W - 1)
 
     logs: Dict[str, float] = {}
     total = dest_logits.new_tensor(0.0)
 
-    # dest loss
     if cfg.w_dest > 0:
-        dest_flat = dest_logits.view(B, -1)               # (B, H*W)
-        dest_index = (x_idx * W + y_idx).long()           # (B,)
+        dest_flat = dest_logits.view(B, -1)                 # (B, H*W)
+        dest_index = (x_idx * W + y_idx).long()             # (B,)
         l_dest = F.cross_entropy(dest_flat, dest_index, reduction="mean")
-        total = total + cfg.w_dest * l_dest
-        logs["loss_dest"] = float(l_dest.detach().cpu())
 
-    # success loss at the sampled cell
+        l_dest_w = cfg.w_dest * l_dest
+        total = total + l_dest_w
+
+        logs["loss_dest"] = float(l_dest_w.detach().cpu())
+
     if cfg.w_succ > 0:
         succ_at = succ_logits[torch.arange(B, device=device), 0, x_idx, y_idx]
         l_succ = F.binary_cross_entropy_with_logits(succ_at, y, reduction="mean")
-        total = total + cfg.w_succ * l_succ
-        logs["loss_succ"] = float(l_succ.detach().cpu())
+
+        l_succ_w = cfg.w_succ * l_succ
+        total = total + l_succ_w
+
+        logs["loss_succ"] = float(l_succ_w.detach().cpu())
+
 
     logs["loss_total"] = float(total.detach().cpu())
-    return total, logs
+    return total, logs"""
 
-def twohead_loss_success_guided(
-    out: Dict[str, torch.Tensor],
-    y: torch.Tensor,          # (B,) completion labels in {0,1}
-    dst_xy: torch.Tensor,     # (B,2) true destination
-    cfg: TwoHeadLossCfg,
-):
+@dataclass
+class TwoHeadLossCfg:
+    w_dest: float = 1.0
+    w_succ: float = 1.0
+    dest_sigma: float = 2.5   # meters/cells
+    dest_clip: float = 50.0   # numeric stability on logits (optional)
+
+
+def _dense_dest_target(
+    x_idx: torch.Tensor,  # (B,) long
+    y_idx: torch.Tensor,  # (B,) long
+    H: int,
+    W: int,
+    sigma: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    # grid (H,W)
+    xs = torch.arange(H, device=device, dtype=dtype).view(H, 1).expand(H, W)
+    ys = torch.arange(W, device=device, dtype=dtype).view(1, W).expand(H, W)
+
+    # (B,H,W)
+    dx = xs.unsqueeze(0) - x_idx.to(device=device, dtype=dtype).view(-1, 1, 1)
+    dy = ys.unsqueeze(0) - y_idx.to(device=device, dtype=dtype).view(-1, 1, 1)
+
+    inv2s2 = 1.0 / (2.0 * (sigma * sigma))
+    logp = -(dx * dx + dy * dy) * inv2s2
+
+    # normalize per-example to a prob distribution over HW
+    p = torch.softmax(logp.view(-1, H * W), dim=1)
+    return p
+
+
+
+def twohead_loss(out: Dict[str, torch.Tensor], y: torch.Tensor, dst_xy: torch.Tensor, cfg: TwoHeadLossCfg):
     dest_logits = out["dest_logits"]   # (B,1,H,W)
     succ_logits = out["succ_logits"]   # (B,1,H,W)
 
+    if dest_logits.shape != succ_logits.shape:
+        raise RuntimeError(f"dest/succ logits mismatch: {tuple(dest_logits.shape)} vs {tuple(succ_logits.shape)}")
+
     B, _, H, W = dest_logits.shape
     device = dest_logits.device
+    dtype = dest_logits.dtype
 
-    # sanitize targets
-    y = y.to(device=device).float().clamp(0, 1)
-    x_idx = dst_xy[:, 0].long().clamp(0, H - 1).to(device)
-    y_idx = dst_xy[:, 1].long().clamp(0, W - 1).to(device)
+    y = y.to(device=device, dtype=dtype).view(B).clamp(0.0, 1.0)
+    x_idx = dst_xy[:, 0].to(device=device).long().clamp(0, H - 1)
+    y_idx = dst_xy[:, 1].to(device=device).long().clamp(0, W - 1)
 
-    logs = {}
+    logs: Dict[str, float] = {}
     total = dest_logits.new_tensor(0.0)
 
-    # --------------------------------------------------
-    # 1. Destination loss — ONLY on completed passes
-    # --------------------------------------------------
+    # ---- dense destination loss (KL to Gaussian target) ----
     if cfg.w_dest > 0:
-        mask = y > 0.5  # completed passes only
-        if mask.any():
-            dest_flat = dest_logits[mask].view(-1, H * W)
-            dest_index = (x_idx[mask] * W + y_idx[mask]).long()
-            l_dest = F.cross_entropy(dest_flat, dest_index, reduction="mean")
-            total = total + cfg.w_dest * l_dest
-            logs["loss_dest"] = float(l_dest.detach().cpu())
-        else:
-            logs["loss_dest"] = 0.0
+        d = dest_logits[:, 0]  # (B,H,W)
+        if cfg.dest_clip and cfg.dest_clip > 0:
+            d = d.clamp(min=-cfg.dest_clip, max=cfg.dest_clip)
 
-    # --------------------------------------------------
-    # 2. Success loss — at attempted destination
-    # --------------------------------------------------
+        log_probs = F.log_softmax(d.view(B, -1), dim=1)  # (B,HW)
+        target = _dense_dest_target(
+            x_idx=x_idx, y_idx=y_idx,
+            H=H, W=W,
+            sigma=float(cfg.dest_sigma),
+            device=device, dtype=log_probs.dtype,
+        )  # (B,HW)
+
+        # KL(target || probs) implemented as KLDiv(log_probs, target)
+        l_dest = F.kl_div(log_probs, target, reduction="batchmean")
+
+        l_dest_w = cfg.w_dest * l_dest
+        total = total + l_dest_w
+        logs["loss_dest"] = float(l_dest_w.detach().cpu())
+
+    # ---- success-at-destination loss (localized BCE) ----
     if cfg.w_succ > 0:
         succ_at = succ_logits[torch.arange(B, device=device), 0, x_idx, y_idx]
         l_succ = F.binary_cross_entropy_with_logits(succ_at, y, reduction="mean")
-        total = total + cfg.w_succ * l_succ
-        logs["loss_succ"] = float(l_succ.detach().cpu())
+
+        l_succ_w = cfg.w_succ * l_succ
+        total = total + l_succ_w
+        logs["loss_succ"] = float(l_succ_w.detach().cpu())
 
     logs["loss_total"] = float(total.detach().cpu())
     return total, logs
 
 # -------------------------
-# Train / Eval
+# Model hook (you fill this in)
 # -------------------------
-@torch.no_grad()
-def eval_epoch(model: nn.Module,
-               feat_paths: List[str],
-               targ_paths: List[str],
-               device: torch.device,
-               batch_size: int,
-               num_workers: int,
-               swap_xy: bool,
-               loss_cfg: TwoHeadLossCfg) -> Tuple[float, float, float]:
-    model.eval()
-    total, total_dest, total_succ, n = 0.0, 0.0, 0.0, 0
 
-    for fp, tp in zip(feat_paths, targ_paths):
-        X = ensure_cnhw(load_tensor_or_dict(fp, ("X",)), H=105, W=68)
-        T = ensure_n3(load_tensor_or_dict(tp, ("targets", "y", "Y")))
-
-        ds = OneShardDataset(X, T, swap_xy=swap_xy)
-        dl = DataLoader(ds, batch_size=batch_size, shuffle=False,
-                        num_workers=num_workers, pin_memory=True, collate_fn=collate_batch)
-
-        for xb, dst_xy, y in dl:
-            xb = xb.to(device, non_blocking=True)
-            dst_xy = dst_xy.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-
-            out = model(xb)
-            loss, logs = twohead_loss(out, y, dst_xy, loss_cfg)
-            b = xb.size(0)
-            total += float(loss.detach().cpu()) * b
-            total_dest += logs.get("loss_dest", 0.0) * b
-            total_succ += logs.get("loss_succ", 0.0) * b
-            n += b
-
-    n = max(1, n)
-    return total / n, total_dest / n, total_succ / n
+def build_model(in_channels: int) -> nn.Module:
+    """
+    Must return dict with:
+      {"dest_logits": (B,1,H,W), "succ_logits": (B,1,H,W)}
+    """
+    # Replace this with your passmap model import / constructor.
+    # from models.passmap import BetterSoccerMap2Head
+    return PitchVisionNet(in_channels=in_channels,base=96)
 
 
-def train():
+# -------------------------
+# Train / Eval loop
+# -------------------------
+
+def run_epoch(
+    model: nn.Module,
+    dl: DataLoader,
+    device: torch.device,
+    static: PitchStaticChannels,
+    loss_cfg: TwoHeadLossCfg,
+    opt: torch.optim.Optimizer | None,
+    grad_clip: float,
+    writer: SummaryWriter,
+    global_step: int,
+    epoch: int,
+    split: str,
+    scaler: GradScaler
+):
+    train_mode = opt is not None
+    model.train(train_mode)
+
+    running_total = 0.0
+    running_dest = 0.0
+    running_succ = 0.0
+    n_seen = 0
+
+    it = tqdm(dl, desc=f"{split}", leave=False)
+    t0 = time.time()
+
+    for xb, dst_xy, y in it:
+        xb = xb.to(device, non_blocking=True)
+        dst_xy = dst_xy.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        xb = static.concat_to(xb, dim=1)  # (B, C_dyn + C_static, H, W)
+
+        if train_mode:
+            opt.zero_grad(set_to_none=True)
+
+        with torch.set_grad_enabled(train_mode):
+            with autocast(device_type="cuda", dtype=torch.float16, enabled=(device.type=="cuda")):
+                out = model(xb)
+                loss, logs = twohead_loss(out, y, dst_xy, loss_cfg)
+
+            if train_mode:
+                scaler.scale(loss).backward()
+                if grad_clip and grad_clip > 0:
+                    scaler.unscale_(opt)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                scaler.step(opt)
+                scaler.update()
+
+
+        b = xb.size(0)
+        n_seen += b
+        running_total += logs["loss_total"] * b
+        running_dest += logs.get("loss_dest", 0.0) * b
+        running_succ += logs.get("loss_succ", 0.0) * b
+
+        it.set_postfix({
+            "loss": f"{running_total/max(1,n_seen):.4f}",
+            "dest": f"{running_dest/max(1,n_seen):.4f}",
+            "succ": f"{running_succ/max(1,n_seen):.4f}",
+        })
+
+        if train_mode:
+            writer.add_scalar(f"{split}/loss_total_step", logs["loss_total"], global_step)
+            if "loss_dest" in logs: writer.add_scalar(f"{split}/loss_dest_step", logs["loss_dest"], global_step)
+            if "loss_succ" in logs: writer.add_scalar(f"{split}/loss_succ_step", logs["loss_succ"], global_step)
+            global_step += 1
+
+    dt = time.time() - t0
+    avg_total = running_total / max(1, n_seen)
+    avg_dest = running_dest / max(1, n_seen)
+    avg_succ = running_succ / max(1, n_seen)
+
+    writer.add_scalar(f"{split}/loss_total", avg_total, epoch)
+    writer.add_scalar(f"{split}/loss_dest", avg_dest, epoch)
+    writer.add_scalar(f"{split}/loss_succ", avg_succ, epoch)
+    writer.add_scalar(f"{split}/epoch_time_s", dt, epoch)
+
+    return avg_total, avg_dest, avg_succ, global_step
+
+
+def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--data_root", type=str, required=True,
-               help="Root directory containing train/ and val/ folders with memmap manifests.")
-    p.add_argument("--cache_size", type=int, default=2,
-                help="How many memmap shards to keep open (LRU).")
+    p.add_argument("--data_root", type=str, required=True)
+    p.add_argument("--cache_size", type=int, default=2)
 
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch_size", type=int, default=64)
@@ -456,24 +400,28 @@ def train():
     p.add_argument("--grad_clip", type=float, default=1.0)
 
     p.add_argument("--seed", type=int, default=19)
-    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--num_workers", type=int, default=16)
     p.add_argument("--cpu", action="store_true")
     p.add_argument("--swap_xy", action="store_true")
 
-    # loss weights
     p.add_argument("--w_dest", type=float, default=1.0)
     p.add_argument("--w_succ", type=float, default=1.0)
 
-    # output
     p.add_argument("--runs_dir", type=str, default="runs")
     p.add_argument("--save_path", type=str, default="best_ckpt.pt")
+
+    # Scheduler (ReduceLROnPlateau)
+    p.add_argument("--sched", type=str, default="plateau", choices=["none", "plateau"])
+    p.add_argument("--plateau_patience", type=int, default=2)
+    p.add_argument("--plateau_factor", type=float, default=0.5)
+    p.add_argument("--plateau_min_lr", type=float, default=1e-6)
+    p.add_argument("--plateau_threshold", type=float, default=1e-4)
+
+    p.add_argument("--viz_n", type=int, default=5)
+    p.add_argument("--viz_seed", type=int, default=42)
+    p.add_argument("--viz_every", type=int, default=1)  # log every N epochs
+
     args = p.parse_args()
-
-    # final runs directory
-
-    
-
-
 
     set_all_seeds(args.seed)
 
@@ -481,7 +429,7 @@ def train():
     print(f"Device: {device}")
 
     train_root = os.path.join(args.data_root, "train")
-    val_root   = os.path.join(args.data_root, "val")
+    val_root = os.path.join(args.data_root, "val")
 
     train_ds = MemmapManifestDataset(
         manifest_path=os.path.join(train_root, "manifest.json"),
@@ -496,118 +444,136 @@ def train():
         cache_size=args.cache_size,
     )
 
-    print(f"[data] train samples={len(train_ds)} val samples={len(val_ds)}")
-    print(f"[data] C,H,W = {train_ds.C},{train_ds.H},{train_ds.W}")
+    fixed_viz_idxs = pick_fixed_val_indices(val_ds, n=args.viz_n, seed=args.viz_seed)
+    print(f"[viz] fixed val indices: {fixed_viz_idxs}")
 
+
+    print(f"[data] train={len(train_ds)} val={len(val_ds)}")
+    print(f"[data] C,H,W={train_ds.C},{train_ds.H},{train_ds.W}")
 
     train_dl = DataLoader(
-    train_ds,
-    batch_size=args.batch_size,
-    shuffle=True,
-    num_workers=args.num_workers,
-    pin_memory=(device.type == "cuda"),
-    collate_fn=collate_batch,
-    drop_last=True,
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=(args.num_workers > 0),
+        prefetch_factor=4,
+        collate_fn=collate_batch,
+        drop_last=True,
     )
+
     val_dl = DataLoader(
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
+        persistent_workers=(args.num_workers > 0),
         collate_fn=collate_batch,
         drop_last=False,
     )
 
+    static = PitchStaticChannels(dims=PitchDims(H=train_ds.H, W=train_ds.W))
+    static = static.to(device=device)
 
-    # model
-    from models.passmap import BetterSoccerMap2Head
-    model = BetterSoccerMap2Head(in_channels=14, base=64, blocks_per_stage=2, dropout=0.0).to(device).float()
+    C_static = int(static.forward().shape[0])
+    in_channels = int(train_ds.C + C_static)
+    print(f"[static] C_static={C_static} -> model in_channels={in_channels}")
+
+
+    model = build_model(in_channels=in_channels).to(device).float()
     arch_name = model.__class__.__name__
 
-    stamp = datetime.now().strftime("%Y%m%d-%H%M")
-    args.run_dir = os.path.join(args.runs_dir, f"{stamp}_{arch_name}")
-    os.makedirs(args.run_dir, exist_ok=True)
-    
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_dir = Path(args.runs_dir) / f"{stamp}_{arch_name}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    writer = SummaryWriter(log_dir=str(run_dir))
+    writer.add_text("hparams",
+                    json.dumps(vars(args), indent=2),
+                    global_step=0)
+    writer.add_text("viz/fixed_indices", str(fixed_viz_idxs), 0)
+
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    writer.add_scalar("opt/lr", args.lr, 0)
+
+    scheduler = None
+    if args.sched == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt,
+            mode="min",
+            factor=args.plateau_factor,
+            patience=args.plateau_patience,
+            threshold=args.plateau_threshold,
+            min_lr=args.plateau_min_lr,
+        )
+
+    scaler = GradScaler(enabled=(device.type == "cuda"))
+
 
     loss_cfg = TwoHeadLossCfg(w_dest=args.w_dest, w_succ=args.w_succ)
 
     best_val = float("inf")
-    history = {"train_total": [], "train_dest": [], "train_succ": [],
-               "val_total": [], "val_dest": [], "val_succ": []}
-
-    def _run_epoch(dl, train_mode: bool):
-        if train_mode:
-            model.train()
-        else:
-            model.eval()
-
-        running_total, running_dest, running_succ, n_seen = 0.0, 0.0, 0.0, 0
-
-        it = tqdm(dl, desc=("train" if train_mode else "val"), leave=False)
-        for xb, dst_xy, y in it:
-            xb = xb.to(device, non_blocking=True)
-            dst_xy = dst_xy.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-
-            # hard stop if NaNs sneak in
-            if not torch.isfinite(xb).all():
-                raise RuntimeError("Non-finite xb detected in dataloader batch")
-
-            if train_mode:
-                opt.zero_grad(set_to_none=True)
-
-            with torch.set_grad_enabled(train_mode):
-                out = model(xb)
-                loss, logs = twohead_loss_fixB(out, y, dst_xy, loss_cfg)
-
-                if not torch.isfinite(loss):
-                    print("\nNon-finite loss encountered!")
-                    print("  xb min/max:", float(xb.min()), float(xb.max()))
-                    print("  dest_logits min/max:",
-                          float(out["dest_logits"].min().detach().cpu()),
-                          float(out["dest_logits"].max().detach().cpu()))
-                    print("  succ_logits min/max:",
-                          float(out["succ_logits"].min().detach().cpu()),
-                          float(out["succ_logits"].max().detach().cpu()))
-                    raise RuntimeError("Stopping due to non-finite loss")
-
-                if train_mode:
-                    loss.backward()
-                    if args.grad_clip and args.grad_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                    opt.step()
-
-            b = xb.size(0)
-            running_total += float(logs["loss_total"]) * b
-            running_dest  += float(logs.get("loss_dest", 0.0)) * b
-            running_succ  += float(logs.get("loss_succ", 0.0)) * b
-            n_seen += b
-
-            it.set_postfix({
-                "loss": f"{running_total/max(1,n_seen):.4f}",
-                "dest": f"{running_dest/max(1,n_seen):.4f}",
-                "succ": f"{running_succ/max(1,n_seen):.4f}",
-            })
-
-        return (
-            running_total / max(1, n_seen),
-            running_dest  / max(1, n_seen),
-            running_succ  / max(1, n_seen),
-        )
+    history = {
+        "train_total": [], "train_dest": [], "train_succ": [],
+        "val_total": [], "val_dest": [], "val_succ": [],
+    }
+    global_step = 0
 
     for epoch in range(args.epochs):
         t0 = time.time()
 
-        train_total, train_dest, train_succ = _run_epoch(train_dl, train_mode=True)
-        val_total, val_dest, val_succ = _run_epoch(val_dl,   train_mode=False)
+        train_total, train_dest, train_succ, global_step = run_epoch(
+            model=model, dl=train_dl, device=device,
+            static=static, loss_cfg=loss_cfg,
+            opt=opt, grad_clip=args.grad_clip,
+            writer=writer, global_step=global_step,
+            epoch=epoch, split="train", scaler= scaler
+        )
+        val_total, val_dest, val_succ, _ = run_epoch(
+            model=model, dl=val_dl, device=device,
+            static=static, loss_cfg=loss_cfg,
+            opt=None, grad_clip=0.0,
+            writer=writer, global_step=global_step,
+            epoch=epoch, split="val", scaler= scaler
+        )
+
+        if (epoch % args.viz_every) == 0:
+            try:
+                log_fixed_val_grid_to_tensorboard(
+                    model=model,
+                    val_ds=val_ds,
+                    static=static,
+                    device=device,
+                    writer=writer,
+                    epoch=epoch,
+                    fixed_idxs=fixed_viz_idxs,
+                    tag="viz/fixed_val_grid",
+                    coords_are_centers=False,
+                    ch_dist2ball=0,
+                    ch_in_pos=3,
+                    ch_out_pos=4,
+                )
+            except Exception as e:
+                print(f"[warn] fixed viz logging failed: {e}")
+
+
+        if scheduler is not None:
+            scheduler.step(val_total)
+
+        # log current LR (after scheduler step)
+        cur_lr = opt.param_groups[0]["lr"]
+        writer.add_scalar("opt/lr", cur_lr, epoch)
+
 
         dt = time.time() - t0
-        print(f"Epoch {epoch:03d} | "
-              f"train={train_total:.6f} (dest={train_dest:.6f}, succ={train_succ:.6f}) | "
-              f"val={val_total:.6f} (dest={val_dest:.6f}, succ={val_succ:.6f}) | "
-              f"time={dt:.1f}s")
+        print(
+            f"Epoch {epoch:03d} | "
+            f"train={train_total:.6f} (dest={train_dest:.6f}, succ={train_succ:.6f}) | "
+            f"val={val_total:.6f} (dest={val_dest:.6f}, succ={val_succ:.6f}) | "
+            f"time={dt:.1f}s"
+        )
 
         history["train_total"].append(train_total)
         history["train_dest"].append(train_dest)
@@ -616,36 +582,42 @@ def train():
         history["val_dest"].append(val_dest)
         history["val_succ"].append(val_succ)
 
+        with open(run_dir / "history.json", "w") as f:
+            json.dump(history, f, indent=2)
+
         if val_total < best_val:
             best_val = val_total
-            ckpt_path = os.path.join(args.run_dir, args.save_path)
-            torch.save({
+            ckpt = {
                 "epoch": epoch,
-                "model": model.state_dict(),
-                "opt": opt.state_dict(),
-                "history": history,
+                "best_val": best_val,
+                "model_state": model.state_dict(),
+                "opt_state": opt.state_dict(),
                 "args": vars(args),
-            }, ckpt_path)
-            print(f"  ✓ saved best checkpoint -> {ckpt_path}")
+                "C_dyn": train_ds.C,
+                "C_static": C_static,
+            }
+            torch.save(ckpt, run_dir / args.save_path)
+            writer.add_text("status", f"saved best ckpt at epoch {epoch} val_total={best_val:.6f}", epoch)
 
-    # plot losses
-    fig_path = os.path.join(args.run_dir, "loss_curve.png")
-    xs = list(range(args.epochs))
-    plt.figure()
-    plt.plot(xs, history["train_total"], label="train_total")
-    plt.plot(xs, history["val_total"], label="val_total")
+    # Plot losses
+    fig = plt.figure(figsize=(10, 6))
+    plt.plot(history["train_total"], label="train_total")
+    plt.plot(history["val_total"], label="val_total")
+    plt.plot(history["train_dest"], label="train_dest", linestyle="--")
+    plt.plot(history["val_dest"], label="val_dest", linestyle="--")
+    plt.plot(history["train_succ"], label="train_succ", linestyle=":")
+    plt.plot(history["val_succ"], label="val_succ", linestyle=":")
     plt.xlabel("epoch")
     plt.ylabel("loss")
-    plt.title("Epoch vs Loss")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(fig_path, dpi=150)
-    print(f"Saved loss plot -> {fig_path}")
+    fig.savefig(run_dir / "loss_curves.png", dpi=200)
+    plt.close(fig)
 
-    save_json(os.path.join(args.run_dir, "history.json"), history)
-
-
+    writer.close()
+    print(f"[done] run_dir={run_dir}")
+    print(f"[done] best_val={best_val:.6f}")
 
 
 if __name__ == "__main__":
-    train()
+    main()

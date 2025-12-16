@@ -1,5 +1,7 @@
 import torch
 import numpy as np
+from matplotlib.colors import LinearSegmentedColormap
+
 
 
 class SoccerVisualizer:
@@ -184,7 +186,8 @@ class SoccerVisualizer:
         mat,
         *,
         ax=None,
-        cmap="hot",
+        cmap=LinearSegmentedColormap.from_list("Pearl Earring - 10 colors",
+                                                       ['#15242e', '#4393c4'], N=10),
         edgecolors="none",
         pitch_kwargs=None,
         heatmap_kwargs=None,
@@ -239,7 +242,8 @@ class SoccerVisualizer:
         out_possession: torch.Tensor,
         *,
         heatmap: torch.Tensor | np.ndarray | None = None,
-        cmap: str = "hot",
+        cmap: str = LinearSegmentedColormap.from_list("Pearl Earring - 10 colors",
+                                                       ['#15242e', '#4393c4'], N=10),
         edgecolors: str = "none",
         pitch_kwargs: dict | None = None,
         in_pos_kwargs: dict | None = None,

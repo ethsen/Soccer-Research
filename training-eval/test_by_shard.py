@@ -64,7 +64,7 @@ def ensure_n3(targs: torch.Tensor) -> torch.Tensor:
 
 def build_model(model_name: str, in_channels: int):
     if model_name == "better2head":
-        from models.passmap import BetterSoccerMap2Head
+        from models.bettermap import BetterSoccerMap2Head
         return BetterSoccerMap2Head(in_channels=in_channels, base=64, blocks_per_stage=2, dropout=0.0)
     raise ValueError(f"Unknown model: {model_name}")
 
