@@ -294,15 +294,19 @@ def twohead_loss(out: Dict[str, torch.Tensor], y: torch.Tensor, dst_xy: torch.Te
 # Model hook (you fill this in)
 # -------------------------
 
-def build_model(in_channels: int) -> nn.Module:
+def build_model(in_channels: int,
+                arch: str) -> nn.Module:
     """
     Must return dict with:
       {"dest_logits": (B,1,H,W), "succ_logits": (B,1,H,W)}
     """
-    # Replace this with your passmap model import / constructor.
-    # from models.passmap import BetterSoccerMap2Head
-    return PitchVisionNet(in_channels=in_channels,base=96)
-
+    if arch == 'passmap':
+        model = PassMap(in_channels= in_channels, base=64, blocks_per_stage= 4)
+    
+    elif arch == 'pitchvision':
+        model = PitchVisionNet(in_channels=in_channels,base=64, blocks_per_stage = 3)
+    
+    return model
 
 # -------------------------
 # Train / Eval loop
@@ -410,6 +414,9 @@ def main():
     p.add_argument("--runs_dir", type=str, default="runs")
     p.add_argument("--save_path", type=str, default="best_ckpt.pt")
 
+    p.add_argument("--arch", type=str, default="pitchvision", choices=["passmap", "pitchvision"],required= True)
+
+
     # Scheduler (ReduceLROnPlateau)
     p.add_argument("--sched", type=str, default="plateau", choices=["none", "plateau"])
     p.add_argument("--plateau_patience", type=int, default=2)
@@ -420,6 +427,7 @@ def main():
     p.add_argument("--viz_n", type=int, default=5)
     p.add_argument("--viz_seed", type=int, default=42)
     p.add_argument("--viz_every", type=int, default=1)  # log every N epochs
+
 
     args = p.parse_args()
 
@@ -482,7 +490,7 @@ def main():
     print(f"[static] C_static={C_static} -> model in_channels={in_channels}")
 
 
-    model = build_model(in_channels=in_channels).to(device).float()
+    model = build_model(in_channels=in_channels, arch= args.arch).to(device).float()
     arch_name = model.__class__.__name__
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
