@@ -2,9 +2,8 @@
 figures
 metrics
 data
-training-runs
-overnight-training-runs
-Reports
 models
+training-runs
+Reports
 data
-testing-notebooks
+testing_notebooks

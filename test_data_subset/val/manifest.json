@@ -1,0 +1,36 @@
+{
+  "format": "memmap_v1",
+  "C": 13,
+  "H": 105,
+  "W": 68,
+  "channels": [
+    "dist_to_ball_norm",
+    "sin_to_ball",
+    "cos_to_ball",
+    "atk_team_1hot",
+    "def_team_1hot",
+    "ball_vx_norm",
+    "ball_vy_norm",
+    "att_glob_vx_norm",
+    "att_glob_vy_norm",
+    "def_glob_vx_norm",
+    "def_glob_vy_norm",
+    "gaussian_control",
+    "nearest_def_dist_norm"
+  ],
+  "shards": [
+    {
+      "x_path": "subset_shard0000_X.f16.mmap",
+      "t_path": "subset_shard0000_T.f32.mmap",
+      "n": 50,
+      "source": {
+        "src_split_root": "/home/ethsen/Soccer-Research/test_data/val",
+        "shard_id": 0,
+        "range": [
+          450,
+          500
+        ]
+      }
+    }
+  ]
+}
