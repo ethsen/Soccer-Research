@@ -18,7 +18,6 @@ class PitchStaticChannels(torch.nn.Module):
     Buffers (float32):
       boundary_dist_norm    : (H,W) in [0,1]
       centerline_dist_norm  : (H,W) in [0,1]
-      midfield_dist_norm    : (H,W) in [0,1]
       goal_sin              : (H,W) in [-1,1]
       goal_cos              : (H,W) in [-1,1]
       goal_dist_norm        : (H,W) in [0,1]

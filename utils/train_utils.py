@@ -3,6 +3,55 @@ import numpy as np
 import torch
 
 
+def _parse_csv(s: str) -> list[str]:
+    s = s.strip()
+    if not s:
+        return []
+    return [t.strip() for t in s.split(",") if t.strip()]
+
+
+def idx_in_kept(original_idx: int, kept: list[int]) -> int | None:
+    # returns new index in the sliced tensor, or None if dropped
+    try:
+        return kept.index(original_idx)
+    except ValueError:
+        return None
+
+def compute_keep_indices(
+    names: list[str],
+    name_to_idx: dict[str, int],
+    keep_csv: str,
+    drop_csv: str,
+    *,
+    allow_empty: bool = False,
+    ) -> list[int]:
+    keep = _parse_csv(keep_csv)
+    drop = _parse_csv(drop_csv)
+
+    if keep and drop:
+        raise ValueError("Use only one of --keep_* or --drop_* (not both).")
+
+    if keep:
+        missing = [k for k in keep if k not in name_to_idx]
+        if missing:
+            raise ValueError(f"Unknown channel(s) in --keep: {missing}. Available={names}")
+        keep_idxs = [name_to_idx[k] for k in keep]
+    else:
+        keep_idxs = list(range(len(names)))
+
+    if drop:
+        missing = [d for d in drop if d not in name_to_idx]
+        if missing:
+            raise ValueError(f"Unknown channel(s) in --drop: {missing}. Available={names}")
+        drop_set = {name_to_idx[d] for d in drop}
+        keep_idxs = [i for i in keep_idxs if i not in drop_set]
+
+    if (len(keep_idxs) == 0) and (not allow_empty):
+        raise ValueError("Ablation removed all channels; keep at least one.")
+    return keep_idxs
+
+
+
 @torch.no_grad()
 def compute_twohead_maps_single(dest_logits_1hw: torch.Tensor, succ_logits_1hw: torch.Tensor):
     """
@@ -37,12 +86,16 @@ def log_fixed_val_grid_to_tensorboard(
     writer,
     epoch: int,
     fixed_idxs: list[int],
+    dyn_keep_idxs: list[int],
+    static_keep_idxs: list[int],
+    zero_ablation: bool = False,
     tag: str = "viz/fixed_val_grid",
     coords_are_centers: bool = False,
     ch_dist2ball: int = 0,
     ch_in_pos: int = 3,
     ch_out_pos: int = 4,
-):
+    ):
+
     """
     Logs a (N rows x 3 cols) figure:
       col0: P(dest|s)
@@ -70,9 +123,26 @@ def log_fixed_val_grid_to_tensorboard(
         dst_xy = dst_xy.unsqueeze(0).to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
 
-        # append static
-        X = static.concat_to(X, dim=1)
+        # ---- apply SAME ablation logic as training ----
+        if zero_ablation:
+            m = torch.zeros(X.shape[1], device=X.device, dtype=X.dtype)
+            m[dyn_keep_idxs] = 1
+            X = X * m.view(1, -1, 1, 1)
+        else:
+            X = X[:, dyn_keep_idxs]
+
+        st = static.expand_to_batch(X.size(0)).to(device=X.device, dtype=X.dtype)  # (1, C_static, H, W)
+
+        if zero_ablation:
+            sm = torch.zeros(st.shape[1], device=st.device, dtype=st.dtype)
+            sm[static_keep_idxs] = 1
+            st = st * sm.view(1, -1, 1, 1)
+        else:
+            st = st[:, static_keep_idxs]
+
+        X = torch.cat([X, st], dim=1)
         X = torch.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
 
         out = model(X)
         dest_logits = out["dest_logits"][0, 0]  # (H,W)

@@ -1,1 +1,10 @@
 *.directory
+figures
+metrics
+data
+training-runs
+overnight-training-runs
+Reports
+models
+data
+testing-notebooks

@@ -7,10 +7,6 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters())
 
 
-
-
-
-
 if __name__ == '__main__':
     sm_model = PassMap(in_channels=18,base=64,blocks_per_stage=4)
     pvnet = PitchVisionNet(in_channels=18,base=64, blocks_per_stage=3)

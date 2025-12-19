@@ -25,8 +25,7 @@ from torch.amp import autocast, GradScaler
 
 
 from utils.static_maps import PitchStaticChannels, PitchDims
-from utils.train_utils import log_fixed_val_grid_to_tensorboard, pick_fixed_val_indices
-from models.bettermap import BetterSoccerMap2Head
+from utils.train_utils import *
 from models.footballmap import PassMap
 from models.pitchvision import PitchVisionNet 
 
@@ -155,56 +154,6 @@ def collate_batch(batch):
     return X, dst_xy, y
 
 
-"""# -------------------------
-# Loss (dest CE + succ BCE@dest)
-# -------------------------
-
-@dataclass
-class TwoHeadLossCfg:
-    w_dest: float = 1.0
-    w_succ: float = 1.0
-
-
-def twohead_loss(out: Dict[str, torch.Tensor], y: torch.Tensor, dst_xy: torch.Tensor, cfg: TwoHeadLossCfg):
-    dest_logits = out["dest_logits"]   # (B,1,H,W)
-    succ_logits = out["succ_logits"]   # (B,1,H,W)
-
-    if dest_logits.shape != succ_logits.shape:
-        raise RuntimeError(f"dest/succ logits mismatch: {tuple(dest_logits.shape)} vs {tuple(succ_logits.shape)}")
-
-    B, _, H, W = dest_logits.shape
-    device = dest_logits.device
-
-    y = y.to(device=device, dtype=dest_logits.dtype).view(B).clamp(0.0, 1.0)
-    x_idx = dst_xy[:, 0].to(device=device).long().clamp(0, H - 1)
-    y_idx = dst_xy[:, 1].to(device=device).long().clamp(0, W - 1)
-
-    logs: Dict[str, float] = {}
-    total = dest_logits.new_tensor(0.0)
-
-    if cfg.w_dest > 0:
-        dest_flat = dest_logits.view(B, -1)                 # (B, H*W)
-        dest_index = (x_idx * W + y_idx).long()             # (B,)
-        l_dest = F.cross_entropy(dest_flat, dest_index, reduction="mean")
-
-        l_dest_w = cfg.w_dest * l_dest
-        total = total + l_dest_w
-
-        logs["loss_dest"] = float(l_dest_w.detach().cpu())
-
-    if cfg.w_succ > 0:
-        succ_at = succ_logits[torch.arange(B, device=device), 0, x_idx, y_idx]
-        l_succ = F.binary_cross_entropy_with_logits(succ_at, y, reduction="mean")
-
-        l_succ_w = cfg.w_succ * l_succ
-        total = total + l_succ_w
-
-        logs["loss_succ"] = float(l_succ_w.detach().cpu())
-
-
-    logs["loss_total"] = float(total.detach().cpu())
-    return total, logs"""
-
 @dataclass
 class TwoHeadLossCfg:
     w_dest: float = 1.0
@@ -291,7 +240,7 @@ def twohead_loss(out: Dict[str, torch.Tensor], y: torch.Tensor, dst_xy: torch.Te
     return total, logs
 
 # -------------------------
-# Model hook (you fill this in)
+# Model hook
 # -------------------------
 
 def build_model(in_channels: int,
@@ -324,31 +273,52 @@ def run_epoch(
     global_step: int,
     epoch: int,
     split: str,
-    scaler: GradScaler
+    scaler: GradScaler,
+    dyn_keep_idxs: list[int],
+    static_keep_idxs: list[int],
+    zero_ablation: bool,
 ):
     train_mode = opt is not None
     model.train(train_mode)
 
-    running_total = 0.0
-    running_dest = 0.0
-    running_succ = 0.0
-    n_seen = 0
-
     it = tqdm(dl, desc=f"{split}", leave=False)
     t0 = time.time()
 
+    running_total = running_dest = running_succ = 0.0
+    n_seen = 0
+
     for xb, dst_xy, y in it:
-        xb = xb.to(device, non_blocking=True)
+        xb = xb.to(device, non_blocking=True)          # (B, C_dyn, H, W)
         dst_xy = dst_xy.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
 
-        xb = static.concat_to(xb, dim=1)  # (B, C_dyn + C_static, H, W)
+        # ---- apply dyn ablation ----
+        if zero_ablation:
+            m = torch.zeros(xb.shape[1], device=xb.device, dtype=xb.dtype)
+            m[dyn_keep_idxs] = 1
+            xb = xb * m.view(1, -1, 1, 1)
+        else:
+            xb = xb[:, dyn_keep_idxs]
 
+        # ---- build + apply static ablation ----
+        st = static.expand_to_batch(xb.size(0)).to(device=xb.device, dtype=xb.dtype)  # (B, C_static, H, W)
+
+        if zero_ablation:
+            sm = torch.zeros(st.shape[1], device=st.device, dtype=st.dtype)
+            sm[static_keep_idxs] = 1
+            st = st * sm.view(1, -1, 1, 1)
+        else:
+            st = st[:, static_keep_idxs]
+
+        # ---- final model input ----
+        xb = torch.cat([xb, st], dim=1)  # (B, C_dyn_eff + C_static_eff, H, W)
+
+        # optimizer / forward / loss (unchanged)
         if train_mode:
             opt.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(train_mode):
-            with autocast(device_type="cuda", dtype=torch.float16, enabled=(device.type=="cuda")):
+            with autocast(device_type="cuda", dtype=torch.float16, enabled=(device.type == "cuda")):
                 out = model(xb)
                 loss, logs = twohead_loss(out, y, dst_xy, loss_cfg)
 
@@ -360,12 +330,11 @@ def run_epoch(
                 scaler.step(opt)
                 scaler.update()
 
-
         b = xb.size(0)
         n_seen += b
         running_total += logs["loss_total"] * b
-        running_dest += logs.get("loss_dest", 0.0) * b
-        running_succ += logs.get("loss_succ", 0.0) * b
+        running_dest  += logs.get("loss_dest", 0.0) * b
+        running_succ  += logs.get("loss_succ", 0.0) * b
 
         it.set_postfix({
             "loss": f"{running_total/max(1,n_seen):.4f}",
@@ -381,15 +350,16 @@ def run_epoch(
 
     dt = time.time() - t0
     avg_total = running_total / max(1, n_seen)
-    avg_dest = running_dest / max(1, n_seen)
-    avg_succ = running_succ / max(1, n_seen)
+    avg_dest  = running_dest  / max(1, n_seen)
+    avg_succ  = running_succ  / max(1, n_seen)
 
     writer.add_scalar(f"{split}/loss_total", avg_total, epoch)
-    writer.add_scalar(f"{split}/loss_dest", avg_dest, epoch)
-    writer.add_scalar(f"{split}/loss_succ", avg_succ, epoch)
+    writer.add_scalar(f"{split}/loss_dest",  avg_dest,  epoch)
+    writer.add_scalar(f"{split}/loss_succ",  avg_succ,  epoch)
     writer.add_scalar(f"{split}/epoch_time_s", dt, epoch)
 
     return avg_total, avg_dest, avg_succ, global_step
+
 
 
 def main():
@@ -428,6 +398,25 @@ def main():
     p.add_argument("--viz_seed", type=int, default=42)
     p.add_argument("--viz_every", type=int, default=1)  # log every N epochs
 
+    # --- Ablations: dynamic channels (from manifest.json) ---
+    p.add_argument("--keep_dyn", type=str, default="",
+                help="Comma-separated dynamic channel names to KEEP (others dropped). Example: dist_to_ball_norm,sin_to_ball")
+    p.add_argument("--drop_dyn", type=str, default="",
+                help="Comma-separated dynamic channel names to DROP. Example: ball_vx_norm,ball_vy_norm")
+
+    # --- Ablations: static channels (from PitchStaticChannels.forward order) ---
+    p.add_argument("--keep_static", type=str, default="",
+                help="Comma-separated static channel names to KEEP. Example: boundary_dist_norm,goal_dist_norm")
+    p.add_argument("--drop_static", type=str, default="",
+                help="Comma-separated static channel names to DROP. Example: centerline_dist_norm,goal_sin,goal_cos")
+
+    # Optional: instead of dropping channels (changing C), you can zero them out.
+    p.add_argument("--zero_ablation", action="store_true",
+                help="If set: keep tensor shapes the same and zero dropped channels instead of slicing them out.")
+
+    p.add_argument("--run_name", type=str, default="", help="Optional name appended to run_dir")
+
+
 
     args = p.parse_args()
 
@@ -452,6 +441,25 @@ def main():
         cache_size=args.cache_size,
     )
 
+    dyn_names = train_ds.channels  # comes from manifest.json channels list
+    dyn_name_to_idx = {n:i for i,n in enumerate(dyn_names)}
+
+    # Static channel names MUST match PitchStaticChannels.forward() stacking order
+    static_names = ["boundary_dist_norm", "centerline_dist_norm", "goal_sin", "goal_cos", "goal_dist_norm"]  # see static_maps.py :contentReference[oaicite:4]{index=4}
+    static_name_to_idx = {n:i for i,n in enumerate(static_names)}
+    dyn_keep_idxs = compute_keep_indices(
+    dyn_names, dyn_name_to_idx, args.keep_dyn, args.drop_dyn, allow_empty=False
+    )
+
+    static_keep_idxs = compute_keep_indices(
+    static_names, static_name_to_idx, args.keep_static, args.drop_static, allow_empty=True
+    )
+    required_for_viz = ["dist_to_ball_norm", "atk_team_1hot", "def_team_1hot"]
+    for name in required_for_viz:
+        if name in dyn_name_to_idx and dyn_name_to_idx[name] not in dyn_keep_idxs:
+            raise ValueError(f"You dropped {name}, but viz requires it.")
+
+    
     fixed_viz_idxs = pick_fixed_val_indices(val_ds, n=args.viz_n, seed=args.viz_seed)
     print(f"[viz] fixed val indices: {fixed_viz_idxs}")
 
@@ -486,7 +494,10 @@ def main():
     static = static.to(device=device)
 
     C_static = int(static.forward().shape[0])
-    in_channels = int(train_ds.C + C_static)
+    C_dyn_eff = train_ds.C if args.zero_ablation else len(dyn_keep_idxs)
+    C_static_eff = C_static if args.zero_ablation else len(static_keep_idxs)
+    in_channels = C_dyn_eff + C_static_eff
+
     print(f"[static] C_static={C_static} -> model in_channels={in_channels}")
 
 
@@ -494,10 +505,12 @@ def main():
     arch_name = model.__class__.__name__
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_dir = Path(args.runs_dir) / f"{stamp}_{arch_name}"
+    suffix = f"_{args.run_name}" if args.run_name else ""
+    run_dir = Path(args.runs_dir) / f"{stamp}_{arch_name}{suffix}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     writer = SummaryWriter(log_dir=str(run_dir))
+    
     writer.add_text("hparams",
                     json.dumps(vars(args), indent=2),
                     global_step=0)
@@ -505,6 +518,10 @@ def main():
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     writer.add_scalar("opt/lr", args.lr, 0)
+
+    writer.add_text("ablation/dyn_used", ",".join([dyn_names[i] for i in dyn_keep_idxs]), 0)
+    writer.add_text("ablation/static_used", ",".join([static_names[i] for i in static_keep_idxs]), 0)
+
 
     scheduler = None
     if args.sched == "plateau":
@@ -528,7 +545,7 @@ def main():
         "val_total": [], "val_dest": [], "val_succ": [],
     }
     global_step = 0
-
+    
     for epoch in range(args.epochs):
         t0 = time.time()
 
@@ -537,14 +554,18 @@ def main():
             static=static, loss_cfg=loss_cfg,
             opt=opt, grad_clip=args.grad_clip,
             writer=writer, global_step=global_step,
-            epoch=epoch, split="train", scaler= scaler
+            epoch=epoch, split="train", scaler= scaler,
+            dyn_keep_idxs=dyn_keep_idxs, static_keep_idxs=static_keep_idxs,
+            zero_ablation = args.zero_ablation
         )
         val_total, val_dest, val_succ, _ = run_epoch(
             model=model, dl=val_dl, device=device,
             static=static, loss_cfg=loss_cfg,
             opt=None, grad_clip=0.0,
             writer=writer, global_step=global_step,
-            epoch=epoch, split="val", scaler= scaler
+            epoch=epoch, split="val", scaler= scaler,
+            dyn_keep_idxs=dyn_keep_idxs, static_keep_idxs=static_keep_idxs,
+            zero_ablation = args.zero_ablation
         )
 
         if (epoch % args.viz_every) == 0:
@@ -562,6 +583,9 @@ def main():
                     ch_dist2ball=0,
                     ch_in_pos=3,
                     ch_out_pos=4,
+                    dyn_keep_idxs=dyn_keep_idxs,
+                    static_keep_idxs=static_keep_idxs,
+                    zero_ablation=args.zero_ablation,
                 )
             except Exception as e:
                 print(f"[warn] fixed viz logging failed: {e}")
